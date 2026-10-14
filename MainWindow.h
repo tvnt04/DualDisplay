@@ -60,6 +60,7 @@ private slots:
     void stopPlayback     (int idx, bool completed = false);
     void onPlaybackTimer  (int idx);
     void writeSaveMetadata(int idx, bool isCaptureStart = false);
+    void appendCaptureTelemetry(const QString& line);
     bool loadPlaybackMetadata(const QString& path, int idx);
     void onFrameReady   (FramePacketPtr pkt);
     void onLogMessage   (const QString& msg);

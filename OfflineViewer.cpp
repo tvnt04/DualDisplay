@@ -789,6 +789,43 @@ void OfflineViewer::onOfflineBrowse()
             }
             m_offlineLogSaveStartSec[idx] = (saveStartSec != -1) ? saveStartSec : m_offlineLogStartTime[idx];
         }
+
+        auto latestTelemetryValue = [](const QList<QPair<int, QString>>& entries,
+                                       const QString& cameraTag, const QString& marker) {
+            QString value = "—";
+            for (const auto& entry : entries) {
+                if (!entry.second.contains(cameraTag) || !entry.second.contains(marker)) continue;
+                value = entry.second.section(marker, -1).trimmed();
+            }
+            return value;
+        };
+        if (isMergedFolder) {
+            const QString sensor0 = latestTelemetryValue(m_offlineLogs[0], "[Cam0]", "Sensor Temp:");
+            const QString sensor1 = latestTelemetryValue(m_offlineLogs[0], "[Cam1]", "Sensor Temp:");
+            const QString grabber0 = latestTelemetryValue(m_offlineLogs[0], "[Cam0]", "Grabber Temp:");
+            const QString grabber1 = latestTelemetryValue(m_offlineLogs[0], "[Cam1]", "Grabber Temp:");
+            const QString fps0 = latestTelemetryValue(m_offlineLogs[0], "[Cam0]", "Grabber instant FPS:");
+            const QString fps1 = latestTelemetryValue(m_offlineLogs[0], "[Cam1]", "Grabber instant FPS:");
+            if (m_offlineViewSensorTempLabels[0])
+                m_offlineViewSensorTempLabels[0]->setText(QString("C0: S: %1 °C | C1: S: %2 °C").arg(sensor0, sensor1));
+            if (m_offlineViewGrabberTempLabels[0])
+                m_offlineViewGrabberTempLabels[0]->setText(QString("C0: G: %1 °C | C1: G: %2 °C").arg(grabber0, grabber1));
+            if (m_offlineViewFpsLabels[0] && fps0 != "—" && fps1 != "—")
+                m_offlineViewFpsLabels[0]->setText(QString("C0: %1 fps | C1: %2 fps").arg(fps0, fps1));
+        } else {
+            for (int idx = 0; idx < 2; ++idx) {
+                const QString cameraTag = QString("[Cam%1]").arg(idx);
+                const QString sensor = latestTelemetryValue(m_offlineLogs[idx], cameraTag, "Sensor Temp:");
+                const QString grabber = latestTelemetryValue(m_offlineLogs[idx], cameraTag, "Grabber Temp:");
+                const QString fps = latestTelemetryValue(m_offlineLogs[idx], cameraTag, "Grabber instant FPS:");
+                if (m_offlineViewSensorTempLabels[idx])
+                    m_offlineViewSensorTempLabels[idx]->setText("S: " + sensor + (sensor == "—" ? "" : " °C"));
+                if (m_offlineViewGrabberTempLabels[idx])
+                    m_offlineViewGrabberTempLabels[idx]->setText("G: " + grabber + (grabber == "—" ? "" : " °C"));
+                if (m_offlineViewFpsLabels[idx] && fps != "—")
+                    m_offlineViewFpsLabels[idx]->setText(fps + " fps");
+            }
+        }
         m_offlineLogTerminal->setPlainText("Logs parsed and ready for playback...");
     }
 }

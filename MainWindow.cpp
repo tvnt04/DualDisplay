@@ -29,6 +29,7 @@
 #include <QPainter>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QRegularExpression>
 #include <algorithm>
 #include <set>
 
@@ -102,6 +103,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
         m_workerThreads[i] = new QThread(this);
         m_workers[i]       = new CameraWorker(i);
         m_workers[i]->moveToThread(m_workerThreads[i]);
+        connect(m_workerThreads[i], &QThread::finished, m_workers[i], &QObject::deleteLater);
         connect(m_workers[i], &CameraWorker::frameReady,    this, &MainWindow::onFrameReady,    Qt::QueuedConnection);
         connect(m_workers[i], &CameraWorker::logMessage,    this, &MainWindow::onLogMessage,    Qt::QueuedConnection);
         connect(m_workers[i], &CameraWorker::streamStarted, this, &MainWindow::onStreamStarted, Qt::QueuedConnection);
@@ -155,12 +157,10 @@ MainWindow::~MainWindow()
         // This is safe even if they are already stopped/closed.
         QMetaObject::invokeMethod(m_workers[i], "closeCamera", Qt::BlockingQueuedConnection);
 
-        // Safely schedule the worker object for deletion within the thread's event loop
-        m_workers[i]->deleteLater();
-
         // Shut down the worker thread cleanly
         m_workerThreads[i]->quit();
-        m_workerThreads[i]->wait(3000);
+        m_workerThreads[i]->wait();
+        m_workers[i] = nullptr;
     }
 
 #if !USING_STUB
@@ -1514,20 +1514,22 @@ void MainWindow::appendLogLine(const QString& line)
     const QString formattedLine = QString("[%1] %2").arg(ts, line);
 
     const bool isTelemetry = line.contains("Sensor Temp:") || line.contains("Grabber Temp:") || line.contains("Grabber instant FPS:");
-    m_logTerminal->appendPlainText(formattedLine);
+    if (!isTelemetry)
+        m_logTerminal->appendPlainText(formattedLine);
 
     for (int idx = 0; idx < 2; ++idx)
     {
         if (m_saving[idx] && !m_saveDirs[idx].isEmpty())
         {
             try {
-                // session.log is the playback log (needs everything, including telemetry)
-                QFile logFile(m_saveDirs[idx] + "/session.log");
-                if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-                {
-                    QTextStream out(&logFile);
-                    out << formattedLine << "\n";
-                    logFile.close();
+                if (!isTelemetry) {
+                    QFile logFile(m_saveDirs[idx] + "/session.log");
+                    if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+                    {
+                        QTextStream out(&logFile);
+                        out << formattedLine << "\n";
+                        logFile.close();
+                    }
                 }
 
                 // terminal.log is the clean full log (only real terminal prints)
@@ -1544,7 +1546,7 @@ void MainWindow::appendLogLine(const QString& line)
         }
     }
 
-    if (m_mergeSaving && !m_mergedSaveDir.isEmpty())
+    if (!isTelemetry && m_mergeSaving && !m_mergedSaveDir.isEmpty())
     {
         try {
             QFile logFile(m_mergedSaveDir + "/session.log");
@@ -1565,6 +1567,27 @@ void MainWindow::appendLogLine(const QString& line)
                 }
             }
         } catch (...) {}
+    }
+}
+
+void MainWindow::appendCaptureTelemetry(const QString& line)
+{
+    const QString ts = QDateTime::currentDateTime().toString("HH:mm:ss");
+    const QString formattedLine = QString("[%1] %2").arg(ts, line);
+    for (int idx = 0; idx < 2; ++idx) {
+        if (!m_saving[idx] || m_saveDirs[idx].isEmpty()) continue;
+        QFile logFile(m_saveDirs[idx] + "/session.log");
+        if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+            QTextStream out(&logFile);
+            out << formattedLine << "\n";
+        }
+    }
+    if (m_mergeSaving && !m_mergedSaveDir.isEmpty()) {
+        QFile logFile(m_mergedSaveDir + "/session.log");
+        if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+            QTextStream out(&logFile);
+            out << formattedLine << "\n";
+        }
     }
 }
 
@@ -2852,6 +2875,12 @@ void MainWindow::onSaveClicked(int idx)
         m_saving[idx] = true;
         writeSaveMetadata(idx, true);
         appendLogLine(QString("[Cam%1] Save started").arg(idx));
+        const QString sensorVal = m_lastSensorTemp[idx] > -999.0f
+            ? QString::number(m_lastSensorTemp[idx], 'f', 1) : "—";
+        const QString grabberVal = m_lastGrabberTemp[idx] > -999.0f
+            ? QString::number(m_lastGrabberTemp[idx], 'f', 1) : "—";
+        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
+        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
         m_panels[idx]->setSaving(true);
         syncSidebarButtons(idx);
         statusBar()->showMessage(QString("[Cam%1] Save started.").arg(idx), 3000);
@@ -3585,6 +3614,14 @@ void MainWindow::onMergeSaveClicked()
             termFile.close();
         }
     }
+    for (int i = 0; i < 2; ++i) {
+        const QString sensorVal = m_lastSensorTemp[i] > -999.0f
+            ? QString::number(m_lastSensorTemp[i], 'f', 1) : "—";
+        const QString grabberVal = m_lastGrabberTemp[i] > -999.0f
+            ? QString::number(m_lastGrabberTemp[i], 'f', 1) : "—";
+        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(i).arg(sensorVal));
+        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(i).arg(grabberVal));
+    }
     syncSidebarButtons(0);
     syncSidebarButtons(1);
     statusBar()->showMessage("Merged save started.", 3000);
@@ -3893,6 +3930,26 @@ void MainWindow::onFrameReady(FramePacketPtr pkt)
 
 void MainWindow::onLogMessage(const QString& m)
 {
+    static const QRegularExpression fpsPattern(R"(\[Cam([01])\] Grabber instant FPS: ([0-9]+(?:\.[0-9]+)?))");
+    const auto fpsMatch = fpsPattern.match(m);
+    if (fpsMatch.hasMatch()) {
+        const int idx = fpsMatch.captured(1).toInt();
+        const double fps = fpsMatch.captured(2).toDouble();
+        if (m_panels[idx]) m_panels[idx]->setAcquisitionFps(fps);
+        if (m_viewFpsLabels[idx]) m_viewFpsLabels[idx]->setText(QString("%1 fps").arg(fps, 0, 'f', 1));
+        const QString liveState = QString("%1 | %2 fps")
+            .arg(m_streaming[idx] ? "Streaming" : (m_connected[idx] ? "Connected" : "Disconnected"))
+            .arg(fps, 0, 'f', 1);
+        if (m_sidebarStateLabels[idx]) m_sidebarStateLabels[idx]->setText(liveState);
+        if (m_topStateLabels[idx]) m_topStateLabels[idx]->setText(liveState);
+        if (m_logTerminal) {
+            const QString ts = QDateTime::currentDateTime().toString("HH:mm:ss");
+            m_logTerminal->appendPlainText(QString("[%1] %2").arg(ts, m));
+        }
+        appendCaptureTelemetry(m);
+        return;
+    }
+
     appendLogLine(m);
     QSignalBlocker blocker(statusBar());
     statusBar()->showMessage(m, 4000);
@@ -3909,6 +3966,7 @@ void MainWindow::onStreamStopped(int i)
 {
     m_streaming[i]=false;
     m_panels[i]->setStreaming(false);
+    m_panels[i]->setAcquisitionFps(0.0);
     syncSidebarButtons(i);
     if (m_viewFpsLabels[i]) m_viewFpsLabels[i]->setText("— fps");
     statusBar()->showMessage(QString("[Cam%1] Stopped.").arg(i),3000);
@@ -4048,12 +4106,11 @@ void MainWindow::onTemperatureReady(int idx, float sensor, float grabber)
     if (m_viewSensorTempLabels[idx])  m_viewSensorTempLabels[idx]->setText(sensorText);
     if (m_viewGrabberTempLabels[idx]) m_viewGrabberTempLabels[idx]->setText(grabberText);
 
-    if (m_saving[idx] || m_mergeSaving)
-    {
+    if (m_saving[idx] || m_mergeSaving) {
         const QString sensorVal = (sensor > -999.0f) ? QString("%1").arg(sensor, 0, 'f', 1) : "—";
         const QString grabberVal = (grabber > -999.0f) ? QString("%1").arg(grabber, 0, 'f', 1) : "—";
-        appendLogLine(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
-        appendLogLine(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
+        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
+        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
     }
 }
 
@@ -4136,17 +4193,6 @@ void MainWindow::applyControlVisibility()
 
 void MainWindow::closeEvent(QCloseEvent* e)
 {
-    for (int i=0;i<2;++i)
-    {
-        if(m_saveFiles[i]){fclose(m_saveFiles[i]);m_saveFiles[i]=nullptr;}
-        
-        // Unconditionally stop the stream and close the camera on the worker thread.
-        QMetaObject::invokeMethod(m_workers[i], "closeCamera", Qt::BlockingQueuedConnection);
-
-        m_connected[i] = false;
-        m_streaming[i] = false;
-        m_saving[i] = false;
-    }
     saveSettings();
     e->accept();
 }

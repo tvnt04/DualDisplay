@@ -300,6 +300,14 @@ void CameraPanel::setSaving(bool v)
     if (saveDurationEdit) saveDurationEdit->setEnabled(!v && stopAfterDurationCheck && stopAfterDurationCheck->isChecked());
 }
 
+void CameraPanel::setAcquisitionFps(double fps)
+{
+    m_acquisitionFps = std::max(0.0, fps);
+    fpsLabel->setText(m_acquisitionFps > 0.0
+        ? QString("%1 fps").arg(m_acquisitionFps, 0, 'f', 1)
+        : "— fps");
+}
+
 bool CameraPanel::updateFrame(const FramePacket& pkt, bool fitToScreen, bool stretch, QSize targetSize, bool isNewFrame)
 {
     bool isOffline = false;
@@ -411,7 +419,8 @@ void CameraPanel::updateFrameInfo(const FramePacket& pkt, const std::vector<uint
     if (now - m_fpsLastMs >= 1000)
     {
         lastFps = m_fpsFrameCount * 1000.0 / (now - m_fpsLastMs);
-        fpsLabel->setText(QString("%1 fps").arg(lastFps, 0, 'f', 1));
+        if (m_acquisitionFps <= 0.0)
+            fpsLabel->setText(QString("%1 fps").arg(lastFps, 0, 'f', 1));
         m_fpsFrameCount = 0;
         m_fpsLastMs = now;
     }

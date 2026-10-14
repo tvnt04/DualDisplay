@@ -27,6 +27,7 @@ public:
     void setConnected(bool v);
     void setStreaming (bool v);
     void setSaving   (bool v);
+    void setAcquisitionFps(double fps);
 
     // Returns true if the frame was painted here (false if detached)
     bool updateFrame(const FramePacket& pkt, bool fitToScreen, bool stretch, QSize targetSize = QSize(), bool isNewFrame = true);
@@ -109,4 +110,5 @@ private:
 
     int          m_fpsFrameCount = 0;
     qint64       m_fpsLastMs     = 0;
+    double       m_acquisitionFps = 0.0;
 };

@@ -18,6 +18,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QMutex>
+#include <QWaitCondition>
 #include <QString>
 #include <vector>
 #include <atomic>
@@ -155,6 +156,9 @@ private slots:
 
 private:
     static void streamCallback(STREAM_BUFFER_HANDLE streamBufferHandle, void* userContext);
+    bool beginStreamCallback();
+    void endStreamCallback();
+    void stopAcceptingStreamCallbacks();
     bool applyCameraParameters(bool includeGeometry);
     CameraParams queryCameraParameters();
     size_t queryActualPayloadSize() const;
@@ -184,4 +188,8 @@ private:
     QThread*       m_streamThread  = nullptr;
     QTimer*        m_tempTimer     = nullptr;
     QMutex         m_mutex;
+    QMutex         m_callbackMutex;
+    QWaitCondition m_callbacksDrained;
+    bool           m_acceptStreamCallbacks = false;
+    int            m_activeStreamCallbacks = 0;
 };

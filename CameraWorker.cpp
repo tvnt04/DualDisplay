@@ -714,29 +714,28 @@ std::vector<uint8_t> CameraWorker::unpackRawTo8bit(const uint8_t* src, int width
 void CameraWorker::streamCallback(STREAM_BUFFER_HANDLE streamBufferHandle, void* userContext)
 {
     CameraWorker* worker = static_cast<CameraWorker*>(userContext);
-    if (!worker)
+    if (!worker || !worker->beginStreamCallback())
         return;
 
     try {
-        if (streamBufferHandle == NULL_STREAM_BUFFER_HANDLE)
-            return;
+        if (streamBufferHandle != NULL_STREAM_BUFFER_HANDLE) {
+            unsigned char* pFrameMemory = nullptr;
+            size_t bufferSize = 0;
+            if (FGSTATUS_OK != KYFG_BufferGetInfo(streamBufferHandle, KY_STREAM_BUFFER_INFO_BASE, &pFrameMemory, NULL, NULL) || !pFrameMemory) {
+                emit worker->errorOccurred(worker->m_camIndex,
+                    QString("Camera %1 callback did not provide frame memory").arg(worker->m_camIndex));
+                KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
+            } else {
+                KYFG_BufferGetInfo(streamBufferHandle, KY_STREAM_BUFFER_INFO_SIZE, &bufferSize, NULL, NULL);
 
-        unsigned char* pFrameMemory = nullptr;
-        size_t bufferSize = 0;
-        if (FGSTATUS_OK != KYFG_BufferGetInfo(streamBufferHandle, KY_STREAM_BUFFER_INFO_BASE, &pFrameMemory, NULL, NULL) || !pFrameMemory)
-        {
-            emit worker->errorOccurred(worker->m_camIndex, QString("Camera %1 callback did not provide frame memory").arg(worker->m_camIndex));
-            KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
-            return;
+                // Queue processing to the worker's own thread to avoid blocking the callback thread.
+                QMetaObject::invokeMethod(worker, "processFrame",
+                                          Qt::QueuedConnection,
+                                          Q_ARG(STREAM_BUFFER_HANDLE, streamBufferHandle),
+                                          Q_ARG(void*, pFrameMemory),
+                                          Q_ARG(size_t, bufferSize));
+            }
         }
-        KYFG_BufferGetInfo(streamBufferHandle, KY_STREAM_BUFFER_INFO_SIZE, &bufferSize, NULL, NULL);
-
-        // Queue processing to the worker's own thread to avoid blocking the callback thread
-        QMetaObject::invokeMethod(worker, "processFrame",
-                                  Qt::QueuedConnection,
-                                  Q_ARG(STREAM_BUFFER_HANDLE, streamBufferHandle),
-                                  Q_ARG(void*, pFrameMemory),
-                                  Q_ARG(size_t, bufferSize));
     }
     catch (const std::exception& e) {
         emit worker->logMessage(QString("[Cam%1] Exception in streamCallback: %2").arg(worker->m_camIndex).arg(e.what()));
@@ -744,6 +743,31 @@ void CameraWorker::streamCallback(STREAM_BUFFER_HANDLE streamBufferHandle, void*
     catch (...) {
         emit worker->logMessage(QString("[Cam%1] Unknown exception in streamCallback").arg(worker->m_camIndex));
     }
+
+    worker->endStreamCallback();
+}
+
+bool CameraWorker::beginStreamCallback()
+{
+    QMutexLocker locker(&m_callbackMutex);
+    if (!m_acceptStreamCallbacks) return false;
+    ++m_activeStreamCallbacks;
+    return true;
+}
+
+void CameraWorker::endStreamCallback()
+{
+    QMutexLocker locker(&m_callbackMutex);
+    if (m_activeStreamCallbacks > 0 && --m_activeStreamCallbacks == 0)
+        m_callbacksDrained.wakeAll();
+}
+
+void CameraWorker::stopAcceptingStreamCallbacks()
+{
+    QMutexLocker locker(&m_callbackMutex);
+    m_acceptStreamCallbacks = false;
+    while (m_activeStreamCallbacks > 0)
+        m_callbacksDrained.wait(&m_callbackMutex);
 }
 
 void CameraWorker::pollTemperature()
@@ -926,6 +950,10 @@ void CameraWorker::openCamera()
             m_streamHandle = INVALID_STREAMHANDLE;
             return;
         }
+        {
+            QMutexLocker callbackLocker(&m_callbackMutex);
+            m_acceptStreamCallbacks = true;
+        }
 
         // Get buffer info
         size_t frameDataSize = 0;
@@ -989,15 +1017,17 @@ void CameraWorker::closeCamera()
     } catch (...) {}
 
     stopStream();
+    stopAcceptingStreamCallbacks();
 
     try {
         QMutexLocker lk(&m_mutex);
 
         // Unregister callback and delete stream
         if (m_streamHandle != INVALID_STREAMHANDLE) {
-            KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
-            KYFG_StreamDelete(m_streamHandle);
+            const STREAM_HANDLE streamToDelete = m_streamHandle;
             m_streamHandle = INVALID_STREAMHANDLE;
+            KYFG_StreamBufferCallbackUnregister(streamToDelete, streamCallback);
+            KYFG_StreamDelete(streamToDelete);
         }
 
         // Free buffers
@@ -1012,9 +1042,11 @@ void CameraWorker::closeCamera()
         m_actualPayloadSize = 0;
         m_streamReopenRequired = false;
 
-        if (m_cameraOpened && m_camHandle != INVALID_CAMHANDLE) {
-            KYFG_CameraClose(m_camHandle);
-            m_cameraOpened = false;
+        if (m_cameraOpened.exchange(false) && m_camHandle != INVALID_CAMHANDLE) {
+            const auto status = KYFG_CameraClose(m_camHandle);
+            if (status != FGSTATUS_OK) {
+                emit logMessage(QString("[Cam%1] Camera close returned %2").arg(m_camIndex).arg(status));
+            }
         }
 
         emit cameraClosed(m_camIndex);
