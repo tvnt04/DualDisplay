@@ -1,0 +1,94 @@
+# Prerequisites & Dependency files
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables & Binaries
+DualDisplay
+*.exe
+*.out
+*.app
+
+# CMake build outputs and temporary artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+build/
+build.log
+*.log
+
+# Qt generated files
+*_autogen/
+*.moc
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+
+# Captured data, frame dumps, and recordings
+Capture/
+*.raw
+*.bmp
+*.avi
+*.mp4
+
+# Runtime user preferences and local configuration
+ui_preferences.ini
+
+# Archives, Backups & Recovery files
+*.zip
+*.tar
+*.tar.gz
+*_recovered.*
+*.bak
+*.orig
+
+# Legacy prototypes, sample scripts & documentation dumps
+LiveDisplayAppDev/
+KYFGLib_Example_QueuedBuffers_Band0_test.c
+camera_description.xml
+camera_unzipped.xml
+API_Data_Book.txt
+vislinx_manual.txt
+fix_canvas.py
+patch_canvas.py
+update_cpp.py
+
+# IDE, Editor & Agent metadata
+.codex
+.vscode/
+.idea/
+.agents/
+*.user
+*.user.*
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
