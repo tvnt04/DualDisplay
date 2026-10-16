@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include "AlignedMemory.h"
 #include "CameraWorker.h"
 
 struct MergeSaveOptions {
@@ -42,24 +43,17 @@ struct AlignedBuffer {
         freeMemory();
         capacity = cap;
         if (cap > 0) {
-#ifdef __linux__
-            if (posix_memalign((void**)&memory, align, cap) != 0) {
+            memory = static_cast<uint8_t*>(alignedAllocate(cap, align));
+            if (!memory) {
                 memory = nullptr;
                 capacity = 0;
             }
-#else
-            memory = (uint8_t*)malloc(cap);
-#endif
         }
     }
 
     void freeMemory() {
         if (memory) {
-#ifdef __linux__
-            free(memory);
-#else
-            free(memory);
-#endif
+            alignedFree(memory);
             memory = nullptr;
         }
         capacity = 0;

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DualDisplay
+Comment=DualDisplay camera analysis application
+Exec=AppRun
+Icon=DualDisplay
+Terminal=false
+Categories=Utility;
+StartupNotify=true

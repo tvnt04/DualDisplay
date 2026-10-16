@@ -1,0 +1,6 @@
+#!/bin/sh
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export LD_LIBRARY_PATH="$HERE/lib/kaya:$HERE/lib:$HERE/lib/qt5:${LD_LIBRARY_PATH:-}"
+export QT_PLUGIN_PATH="$HERE/lib/qt5/plugins"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$HERE/lib/qt5/plugins/platforms"
+exec "$HERE/DualDisplay" "$@"

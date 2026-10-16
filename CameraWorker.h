@@ -25,10 +25,10 @@
 #include <cstdint>
 #include <cstdio>
 
-#if 1 // Always use real hardware
-#include "KYFGLibA.h"
-#else
+#if USING_STUB
 #include "KYFGLib_Stub.h"
+#else
+#include "KYFGLibA.h"
 #endif
 
 #include <QDateTime>
@@ -71,6 +71,8 @@ struct CameraParams {
     QString rawFilePath;           // path to .raw file for stub playback
 };
 
+Q_DECLARE_METATYPE(CameraParams)
+
 // ════════════════════════════════════════════════════════════════════════
 class CameraWorker : public QObject
 {
@@ -78,8 +80,6 @@ class CameraWorker : public QObject
 public:
     explicit CameraWorker(int camIndex, QObject* parent = nullptr);
     ~CameraWorker();
-
-    void setParams(const CameraParams& p);
 
     // ── SWAP POINT: real hardware only needs these two setters ──────────
     void setFgHandle (FGHANDLE fg);
@@ -135,6 +135,7 @@ signals:
 
 public slots:
     // ── These slots are the entire API surface ───────────────────────
+    void setParams  (const CameraParams& p);
     void openCamera ();   // connect to hardware / open raw file
     void closeCamera();   // disconnect
     void startStream();   // begin frame acquisition
@@ -151,7 +152,7 @@ public slots:
     void applyAllParameters(const CameraParams& p);
 
 private slots:
-    void processFrame(STREAM_BUFFER_HANDLE streamBufferHandle, void* pFrameMemory, size_t bufferSize);
+    void processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBufferHandle, void* pFrameMemory, size_t bufferSize);
     void pollTemperature();
 
 private:
@@ -181,6 +182,7 @@ private:
     std::atomic<bool> m_fileOpen{false};
     std::atomic<bool> m_saving{false};
     std::atomic<bool> m_streamReopenRequired{false};
+    std::atomic<quint64> m_streamEpoch{1};
 
     FILE*          m_rawFile       = nullptr;
     long           m_bytesPerFrame = 0;

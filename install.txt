@@ -1,0 +1,14 @@
+AppImage:
+
+Open a terminal in the download folder
+Run:
+chmod +x DualDisplay-1.4.1-linux-x86_64.AppImage
+./DualDisplay-1.4.1-linux-x86_64.AppImage
+
+Debian package:
+
+Open a terminal in the download folder
+Run:
+sudo dpkg -i dualdisplay_1.4.1_amd64.deb
+sudo apt-get install -f
+dualdisplay

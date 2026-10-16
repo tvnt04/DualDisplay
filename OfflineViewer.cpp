@@ -1618,7 +1618,8 @@ bool OfflineViewer::eventFilter(QObject* watched, QEvent* event)
 
     if (activeIdx != -1 && m_analysisPanel && m_analysisPanel->isVisible()) {
         QLabel* lbl = m_offlineViewLabels[activeIdx];
-        if (lbl && lbl->pixmap() && !lbl->pixmap()->isNull()) {
+        const QPixmap px = lbl ? lbl->pixmap(Qt::ReturnByValue) : QPixmap();
+        if (!px.isNull()) {
             QMouseEvent* mouseEv = dynamic_cast<QMouseEvent*>(event);
             if (mouseEv) {
                 QPoint mousePos = mouseEv->pos();
@@ -1627,7 +1628,7 @@ bool OfflineViewer::eventFilter(QObject* watched, QEvent* event)
 
                 if (origW > 0 && origH > 0) {
                     QSize lblSize = lbl->size();
-                    QSize pxSize = lbl->pixmap()->size();
+                    QSize pxSize = px.size();
 
                     int offsetX = (lblSize.width() - pxSize.width()) / 2;
                     int offsetY = (lblSize.height() - pxSize.height()) / 2;

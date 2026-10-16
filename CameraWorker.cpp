@@ -1,4 +1,5 @@
 #include "CameraWorker.h"
+#include "AlignedMemory.h"
 #include <QThread>
 #include <QMetaObject>
 #include <QTimer>
@@ -65,24 +66,6 @@ std::vector<uint8_t> unpackPackedWithKaya(const uint8_t* src, int width, int hei
 #endif
 }
 
-#ifdef __linux__ // _aligned_malloc() implementation for __linux__
-#include <signal.h>
-void* _aligned_malloc(size_t size, size_t alignment)
-{
-    size_t pageAlign = size % 4096;
-    if (pageAlign)
-    {
-        size += (4096 - pageAlign);
-    }
-
-    void * memptr = 0;
-    if (posix_memalign(&memptr, alignment, size) != 0)
-        return nullptr;
-    return memptr;
-}
-#define _aligned_free free
-#endif // #ifdef __linux__
-
 CameraWorker::CameraWorker(int camIndex, QObject* parent)
     : QObject(parent), m_camIndex(camIndex)
 {
@@ -94,17 +77,20 @@ CameraWorker::CameraWorker(int camIndex, QObject* parent)
     connect(m_tempTimer, &QTimer::timeout, this, &CameraWorker::pollTemperature);
 }
 
-CameraWorker::~CameraWorker() { closeCamera(); }
+CameraWorker::~CameraWorker() {
+    blockSignals(true);
+    closeCamera();
+}
 
 // ── processFrame slot ──────────────────────────────────────────────────
-void CameraWorker::processFrame(STREAM_BUFFER_HANDLE streamBufferHandle, void* pFrameMem, size_t bufferSize)
+void CameraWorker::processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBufferHandle, void* pFrameMem, size_t bufferSize)
 {
     if (streamBufferHandle == NULL_STREAM_BUFFER_HANDLE)
         return;
 
-    // Safely discard frame if we've stopped streaming or closed the camera,
-    // since the underlying buffers or stream handle may be freed/invalid.
-    if (!m_streaming || !m_cameraOpened || m_streamHandle == INVALID_STREAMHANDLE)
+    // Safely discard frame if this buffer belongs to an older/recreated stream session,
+    // or if we've stopped streaming or closed the camera.
+    if (epoch != m_streamEpoch.load() || !m_streaming || !m_cameraOpened || m_streamHandle == INVALID_STREAMHANDLE)
         return;
 
     try {
@@ -669,7 +655,10 @@ std::vector<uint8_t> CameraWorker::unpackRawTo8bit(const uint8_t* src, int width
     // 1. 8-bit raw (approx 1.0 byte/pixel)
     if (bpp >= 0.90 && bpp <= 1.10)
     {
-        return std::vector<uint8_t>(src, src + total);
+        std::vector<uint8_t> out(total, 0);
+        const size_t copyBytes = std::min(static_cast<size_t>(total), bufferSize);
+        std::memcpy(out.data(), src, copyBytes);
+        return out;
     }
     // 2. 10-bit packed raw (4 pixels in 5 bytes)
     if (bufferSize >= expected10Packed && bufferSize < expected12Packed)
@@ -694,11 +683,13 @@ std::vector<uint8_t> CameraWorker::unpackRawTo8bit(const uint8_t* src, int width
     // 4. 16-bit uint16 container (approx 2.0 bytes/pixel)
     if (bpp >= 1.80 && bpp <= 2.20)
     {
-        std::vector<uint8_t> out(total);
+        std::vector<uint8_t> out(total, 0);
         const uint16_t* src16 = reinterpret_cast<const uint16_t*>(src);
         uint8_t* dest = out.data();
+        const size_t availablePixels = bufferSize / 2;
+        const int safeLimit = static_cast<int>(std::min(static_cast<size_t>(total), availablePixels));
         #pragma omp parallel for schedule(static)
-        for (int i = 0; i < total; ++i)
+        for (int i = 0; i < safeLimit; ++i)
         {
             uint16_t val = src16[i];
             dest[i] = (val > 4095) ? static_cast<uint8_t>(val >> 8) : static_cast<uint8_t>(val >> 4);
@@ -728,9 +719,11 @@ void CameraWorker::streamCallback(STREAM_BUFFER_HANDLE streamBufferHandle, void*
             } else {
                 KYFG_BufferGetInfo(streamBufferHandle, KY_STREAM_BUFFER_INFO_SIZE, &bufferSize, NULL, NULL);
 
+                const quint64 currentEpoch = worker->m_streamEpoch.load();
                 // Queue processing to the worker's own thread to avoid blocking the callback thread.
                 QMetaObject::invokeMethod(worker, "processFrame",
                                           Qt::QueuedConnection,
+                                          Q_ARG(quint64, currentEpoch),
                                           Q_ARG(STREAM_BUFFER_HANDLE, streamBufferHandle),
                                           Q_ARG(void*, pFrameMemory),
                                           Q_ARG(size_t, bufferSize));
@@ -974,10 +967,22 @@ void CameraWorker::openCamera()
 
         // Allocate buffers
         for (int i = 0; i < 16; ++i) {
-            m_pBuffers[i] = _aligned_malloc(frameDataSize, frameDataAligment);
+            m_pBuffers[i] = alignedAllocate(frameDataSize, frameDataAligment);
             if (!m_pBuffers[i])
             {
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer allocation failed at index %2").arg(m_camIndex).arg(i));
+                for (int j = 0; j < i; ++j) {
+                    if (m_pBuffers[j]) {
+                        alignedFree(m_pBuffers[j]);
+                        m_pBuffers[j] = nullptr;
+                    }
+                    m_streamBuffers[j] = 0;
+                }
+                if (m_streamHandle != INVALID_STREAMHANDLE) {
+                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
+                    KYFG_StreamDelete(m_streamHandle);
+                    m_streamHandle = INVALID_STREAMHANDLE;
+                }
                 return;
             }
 
@@ -985,6 +990,20 @@ void CameraWorker::openCamera()
             if (status != FGSTATUS_OK)
             {
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer announce failed at index %2: %3").arg(m_camIndex).arg(i).arg(status));
+                alignedFree(m_pBuffers[i]);
+                m_pBuffers[i] = nullptr;
+                for (int j = 0; j < i; ++j) {
+                    if (m_pBuffers[j]) {
+                        alignedFree(m_pBuffers[j]);
+                        m_pBuffers[j] = nullptr;
+                    }
+                    m_streamBuffers[j] = 0;
+                }
+                if (m_streamHandle != INVALID_STREAMHANDLE) {
+                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
+                    KYFG_StreamDelete(m_streamHandle);
+                    m_streamHandle = INVALID_STREAMHANDLE;
+                }
                 return;
             }
         }
@@ -994,6 +1013,7 @@ void CameraWorker::openCamera()
         m_actualPayloadSize = queryActualPayloadSize();
         if (m_actualPayloadSize > m_frameDataSize)
             m_actualPayloadSize = m_frameDataSize;
+        m_streamEpoch.fetch_add(1);
         emit logMessage(QString("[Cam%1] Opened: W=%2 H=%3 buffer=%4 actualPayload=%5 alignment=%6")
             .arg(m_camIndex).arg(m_params.width).arg(m_params.height).arg(frameDataSize)
             .arg(m_actualPayloadSize).arg(frameDataAligment));
@@ -1018,6 +1038,7 @@ void CameraWorker::closeCamera()
 
     stopStream();
     stopAcceptingStreamCallbacks();
+    m_streamEpoch.fetch_add(1);
 
     try {
         QMutexLocker lk(&m_mutex);
@@ -1033,7 +1054,7 @@ void CameraWorker::closeCamera()
         // Free buffers
         for (int i = 0; i < 16; ++i) {
             if (m_pBuffers[i]) {
-                _aligned_free(m_pBuffers[i]);
+                alignedFree(m_pBuffers[i]);
                 m_pBuffers[i] = nullptr;
             }
             m_streamBuffers[i] = 0;
@@ -1473,6 +1494,9 @@ void CameraWorker::applyGeometry(int width, int height)
 
         if (m_cameraOpened && m_camHandle != INVALID_CAMHANDLE)
         {
+            stopAcceptingStreamCallbacks();
+            m_streamEpoch.fetch_add(1);
+
             // We must release the old stream and buffers first because payload size will change!
             if (m_streamHandle != INVALID_STREAMHANDLE)
             {
@@ -1484,7 +1508,7 @@ void CameraWorker::applyGeometry(int width, int height)
             {
                 if (m_pBuffers[i])
                 {
-                    _aligned_free(m_pBuffers[i]);
+                    alignedFree(m_pBuffers[i]);
                     m_pBuffers[i] = nullptr;
                 }
                 m_streamBuffers[i] = 0;
@@ -1516,6 +1540,8 @@ void CameraWorker::applyGeometry(int width, int height)
             if (status != FGSTATUS_OK || frameDataSize == 0)
             {
                 emit errorOccurred(m_camIndex, QString("Camera %1 payload size query failed: %2").arg(m_camIndex).arg(status));
+                KYFG_StreamDelete(m_streamHandle);
+                m_streamHandle = INVALID_STREAMHANDLE;
                 return;
             }
 
@@ -1523,23 +1549,51 @@ void CameraWorker::applyGeometry(int width, int height)
             if (status != FGSTATUS_OK || frameDataAligment == 0)
             {
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer alignment query failed: %2").arg(m_camIndex).arg(status));
+                KYFG_StreamDelete(m_streamHandle);
+                m_streamHandle = INVALID_STREAMHANDLE;
                 return;
             }
 
             for (int i = 0; i < 16; ++i)
             {
-                m_pBuffers[i] = _aligned_malloc(frameDataSize, frameDataAligment);
+                m_pBuffers[i] = alignedAllocate(frameDataSize, frameDataAligment);
                 if (!m_pBuffers[i])
                 {
                     emit errorOccurred(m_camIndex, QString("Camera %1 buffer allocation failed at index %2").arg(m_camIndex).arg(i));
+                    for (int j = 0; j < i; ++j) {
+                        if (m_pBuffers[j]) {
+                            alignedFree(m_pBuffers[j]);
+                            m_pBuffers[j] = nullptr;
+                        }
+                        m_streamBuffers[j] = 0;
+                    }
+                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
+                    KYFG_StreamDelete(m_streamHandle);
+                    m_streamHandle = INVALID_STREAMHANDLE;
                     return;
                 }
                 status = KYFG_BufferAnnounce(m_streamHandle, m_pBuffers[i], frameDataSize, NULL, &m_streamBuffers[i]);
                 if (status != FGSTATUS_OK)
                 {
                     emit errorOccurred(m_camIndex, QString("Camera %1 buffer announce failed at index %2: %3").arg(m_camIndex).arg(i).arg(status));
+                    alignedFree(m_pBuffers[i]);
+                    m_pBuffers[i] = nullptr;
+                    for (int j = 0; j < i; ++j) {
+                        if (m_pBuffers[j]) {
+                            alignedFree(m_pBuffers[j]);
+                            m_pBuffers[j] = nullptr;
+                        }
+                        m_streamBuffers[j] = 0;
+                    }
+                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
+                    KYFG_StreamDelete(m_streamHandle);
+                    m_streamHandle = INVALID_STREAMHANDLE;
                     return;
                 }
+            }
+            {
+                QMutexLocker callbackLocker(&m_callbackMutex);
+                m_acceptStreamCallbacks = true;
             }
             m_frameDataSize = frameDataSize;
             m_streamReopenRequired = false;

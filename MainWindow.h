@@ -30,10 +30,12 @@ class QFile;
 #include "CameraWorker.h"
 #include "DetachedView.h"
 #include "MergeSaver.h"
-
-#if !USING_STUB
-#include "KYFGLibA.h"
-#endif
+#include "ThemeManager.h"
+#include "SettingsManager.h"
+#include "CalibrationEngine.h"
+#include "PlaybackController.h"
+#include "CaptureController.h"
+#include "CameraManager.h"
 
 using FramePacketPtr = std::shared_ptr<FramePacket>;
 
@@ -58,10 +60,6 @@ private slots:
     void onBrowseRaw      (int idx);
     void onBrowseSave     (int idx);
     void stopPlayback     (int idx, bool completed = false);
-    void onPlaybackTimer  (int idx);
-    void writeSaveMetadata(int idx, bool isCaptureStart = false);
-    void appendCaptureTelemetry(const QString& line);
-    bool loadPlaybackMetadata(const QString& path, int idx);
     void onFrameReady   (FramePacketPtr pkt);
     void onLogMessage   (const QString& msg);
     void onStreamStarted(int idx);
@@ -80,8 +78,6 @@ private slots:
     void onMergeSaverStats    (quint64 savedCount, quint64 droppedCount, quint64 queueDepth);
     void onToggleControlsClicked();
     void onPixelStretchToggled(bool checked);
-    void onStreamCountdown      (int idx);
-    void stopStreamCountdown    (int idx);
     void applyPresetSideBySide  ();
     void applyPresetTopBottom   ();
     void applyPresetDualControl ();
@@ -97,116 +93,8 @@ private slots:
     int  getActiveRegionOffset(int idx) const;
     int  getLineDelayValue() const;
     void setLineDelayValue(int val);
+    bool isMergeSaving() const;
 private:
-    struct CameraUiState {
-        QString width = "9344";
-        QString height = "3840";
-        QString appliedWidth = "9344";
-        QString appliedHeight = "3840";
-        QString fps = "1.0";
-        QString exposure = "29999";
-        QString gain = "1.0";
-        QString testPattern = "Off";
-        QString tdiMode = "Off";
-        QString tdiStages = "4";
-        QString tdiYShift = "16";
-        QString tdiFrameCount = "10";
-        bool reverseX = false;
-        bool reverseY = false;
-        QString savePath = "Capture";
-        QString rawPath = "";
-        QString saveFormat = ".raw";
-        QString saveMode = "Single File";
-        bool stopAfterEnabled = false;
-        QString saveDuration = "5.0";
-    };
-
-    struct DelayBuffer {
-        std::vector<uint8_t> buffer;
-        int writeIndex = 0;
-        int delayLines = 0;
-        int linePitch = 0;
-        qint64 totalLinesPushed = 0;
-
-        void reset(int delay_lines, int pitch) {
-            delayLines = delay_lines;
-            linePitch = pitch;
-            int capacityLines = delayLines + 20000;
-            size_t capacityBytes = static_cast<size_t>(capacityLines) * static_cast<size_t>(linePitch);
-            try {
-                buffer.assign(capacityBytes, 0);
-            } catch (...) {
-                delayLines = 0;
-                buffer.clear();
-            }
-            writeIndex = 0;
-            totalLinesPushed = 0;
-        }
-
-        FramePacketPtr process(FramePacketPtr pkt) {
-            if (delayLines <= 0 || !pkt) return pkt;
-            if (pkt->rawData.empty()) return pkt;
-            int H = pkt->height;
-            if (H <= 0) return pkt;
-            if (pkt->rawData.size() % static_cast<size_t>(H) != 0) return pkt;
-            const int rawLinePitch = static_cast<int>(pkt->rawData.size() / static_cast<size_t>(H));
-            if (rawLinePitch <= 0) return pkt;
-
-            const int H_img = (H > 1) ? (H - 1) : H;
-
-            if (buffer.empty() || linePitch != rawLinePitch) {
-                reset(delayLines, rawLinePitch);
-            }
-
-            int capacityLines = buffer.size() / linePitch;
-            if (capacityLines < delayLines + H_img) {
-                reset(delayLines, rawLinePitch);
-                capacityLines = buffer.size() / linePitch;
-            }
-            if (capacityLines <= 0) return pkt;
-            
-            for (int i = 0; i < H_img; i++) {
-                size_t destIdx = static_cast<size_t>(writeIndex) * static_cast<size_t>(linePitch);
-                size_t srcIdx = static_cast<size_t>(i) * static_cast<size_t>(linePitch);
-                memcpy(&buffer[destIdx], &pkt->rawData[srcIdx], linePitch);
-                writeIndex = (writeIndex + 1) % capacityLines;
-            }
-            totalLinesPushed += H_img;
-            
-            FramePacketPtr out = std::make_shared<FramePacket>();
-            out->width = pkt->width;
-            out->height = pkt->height;
-            out->cameraIndex = pkt->cameraIndex;
-            out->frameId = pkt->frameId;
-            out->timestampMs = pkt->timestampMs;
-            out->packedMin = pkt->packedMin;
-            out->packedMax = pkt->packedMax;
-            out->rawData.resize(static_cast<size_t>(H) * static_cast<size_t>(linePitch));
-            
-            qint64 currentFrameStartLine = totalLinesPushed - H_img;
-            
-            for (int i = 0; i < H_img; i++) {
-                qint64 delayedGlobalLine = (currentFrameStartLine + i) - delayLines;
-                int destRow = static_cast<int>((delayedGlobalLine % H_img + H_img) % H_img);
-                
-                int bufSlot = static_cast<int>((writeIndex - H_img - delayLines + i) % capacityLines);
-                while (bufSlot < 0) bufSlot += capacityLines;
-                
-                size_t destIdx = static_cast<size_t>(destRow) * static_cast<size_t>(linePitch);
-                size_t srcIdx = static_cast<size_t>(bufSlot) * static_cast<size_t>(linePitch);
-                memcpy(&out->rawData[destIdx], &buffer[srcIdx], linePitch);
-            }
-            
-            if (H > H_img) {
-                size_t destIdx = static_cast<size_t>(H_img) * static_cast<size_t>(linePitch);
-                size_t srcIdx = static_cast<size_t>(H_img) * static_cast<size_t>(linePitch);
-                memcpy(&out->rawData[destIdx], &pkt->rawData[srcIdx], linePitch);
-            }
-            
-            return out;
-        }
-    };
-
     void buildUI    ();
     void applyStyles();
     void setDarkMode(bool dark);
@@ -241,12 +129,12 @@ private:
         DualControl,
         ControlsTop
     };
-    CameraWorker* m_workers      [2] = {};
-    QThread*      m_workerThreads[2] = {};
-    CameraPanel*  m_panels[2] = {};
-    CameraUiState m_cameraUiStates[2];
-    DelayBuffer   m_cam1DelayBuffer;
-    DelayBuffer   m_cam2DelayBuffer;
+    CameraManager*      m_cameraManager = nullptr;
+    CaptureController*  m_captureController = nullptr;
+    PlaybackController* m_playbackController = nullptr;
+    CalibrationEngine*  m_calibrationEngine = nullptr;
+    CameraPanel*        m_panels[2] = {};
+    CameraUiState       m_cameraUiStates[2];
     QWidget*      m_panelParking = nullptr;
     QWidget*      m_viewWidgets[2] = {};
     QLabel*       m_viewLabels [2] = {};
@@ -350,46 +238,21 @@ private:
     QPushButton*    m_saveAllBtn = nullptr;
     QPushButton*    m_saveModeToggleBtn = nullptr;
     QPushButton*    m_toggleControlsBtn = nullptr;
-    MergeSaver*     m_mergeSaver = nullptr;
-    bool            m_mergeSaving = false;
-    QString         m_mergedSaveDir;
-    QComboBox*      m_lineDelaySpin;
-    QDoubleSpinBox* m_timeDelaySpin;
-    QComboBox*      m_calibModeCombo;
-    QStackedWidget* m_syncStackedWidget;
-    QPushButton*    m_startCalibrationBtn;
-    QPushButton*    m_markCam1Btn;
-    QPushButton*    m_markCam2Btn;
-    QPushButton*    m_floatCam1Btn;
-    
-    bool        m_calibrationMode = false;
-    bool        m_autoCam1Detected = false;
-    bool        m_autoCam2Detected = false;
-    qint64      m_cam1MarkLines = 0;
-    qint64      m_cam2MarkLines = 0;
-    qint64      m_totalLinesReceived[2] = {0, 0};
+    QComboBox*      m_lineDelaySpin = nullptr;
+    QDoubleSpinBox* m_timeDelaySpin = nullptr;
+    QComboBox*      m_calibModeCombo = nullptr;
+    QStackedWidget* m_syncStackedWidget = nullptr;
+    QPushButton*    m_startCalibrationBtn = nullptr;
+    QPushButton*    m_markCam1Btn = nullptr;
+    QPushButton*    m_markCam2Btn = nullptr;
+    QPushButton*    m_floatCam1Btn = nullptr;
+
     bool        m_connected [2] = {};
     bool        m_streaming [2] = {};
     bool        m_saving    [2] = {};
     bool        m_playing   [2] = {};
     int         m_lastAppliedRegionOffset[2] = {0, 0};
     int         m_frameCount[2] = {};
-    int         m_saveFrameCount[2] = {};
-    qint64      m_firstSavedFrameMs[2] = {};
-    qint64      m_lastSavedFrameMs[2] = {};
-    int         m_savedFrameWidth[2] = {};
-    int         m_savedFrameHeight[2] = {};
-    int         m_emptyRawFrameSkips[2] = {};
-    FILE*       m_saveFiles [2] = {};
-    QString     m_saveDirs  [2];
-    QTimer*     m_playbackTimers[2] = {};
-    QFile*      m_playbackFile[2] = {};
-    QStringList m_playbackFiles[2];
-    int         m_playbackIndex[2] = {};
-    qint64      m_playbackFrameSize[2] = {};
-    bool        m_playbackRawSequence[2] = {};
-    QTimer*     m_streamCountdownTimers[2] = {};
-    qint64      m_streamEndMs [2] = {};
     QCheckBox*  m_pixelStretchCheck = nullptr;
     FramePacketPtr m_lastFrames[2];
     qint64      m_lastDisplayMs[2] = {};
@@ -399,14 +262,6 @@ private:
     bool        m_fitToScreen  = true;
     bool        m_pixelStretch = false;
     double      m_zoomFactors[2] = {1.0, 1.0};
-
-#if !USING_STUB
-    std::vector<FGHANDLE> m_fgHandles;
-    CAMHANDLE     m_camHandles[2] = {INVALID_CAMHANDLE, INVALID_CAMHANDLE};
-    CAMHANDLE     m_detectedCamHandles[KY_MAX_CAMERAS] = {};
-    FGHANDLE      m_detectedCamFgs[KY_MAX_CAMERAS] = {};
-    int           m_detectedCameraCount = 0;
-#endif
 
 signals:
     void displaySettingsChanged();

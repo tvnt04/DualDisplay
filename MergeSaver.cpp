@@ -1,4 +1,5 @@
 #include "MergeSaver.h"
+#include "NativeFile.h"
 #include <QDir>
 #include <QDateTime>
 #include <QDebug>
@@ -17,6 +18,7 @@ MergeSaver::MergeSaver(QObject* parent)
 
 MergeSaver::~MergeSaver()
 {
+    blockSignals(true);
     stopSession();
 }
 
@@ -80,7 +82,7 @@ bool MergeSaver::startSession(const QString& sessionDir, const MergeSaveOptions&
     // Open single raw file if option selected
     if (m_options.useSingleFile) {
         const QString rawPath = m_sessionDir + "/Merged_Capture.raw";
-        m_rawFile = fopen(rawPath.toLocal8Bit().constData(), "wb");
+        m_rawFile = openBinaryFile(rawPath);
         if (!m_rawFile) {
             emit logMessage(QString("[MergeSaver] Failed to open single raw output file: %1").arg(rawPath));
             m_metaFile.close();
@@ -136,8 +138,8 @@ void MergeSaver::stopSession()
     m_stopRequested.store(true);
     m_cond.wakeAll();
 
-    // Wait for save thread to finish flushing queue
-    wait(10000);
+    // Wait for save thread to finish flushing queue completely before cleanup
+    wait();
 
     double recordedFps = m_options.fps > 0.0 ? m_options.fps : 10.0;
     const qint64 captureSpanMs = m_lastSavedFrameTimestampMs - m_firstSavedFrameTimestampMs;
@@ -282,6 +284,10 @@ bool MergeSaver::composeMergedPixels(const FramePacket& p0, const FramePacket& p
     outW = w0 + w1;
     outH = std::max(h0, h1);
 
+    if (pix0.size() < static_cast<size_t>(w0) * h0 || pix1.size() < static_cast<size_t>(w1) * h1) {
+        return false;
+    }
+
     const size_t totalPixels = static_cast<size_t>(outW) * outH;
     if (buf.capacity < totalPixels) {
         emit logMessage(QString("[MergeSaver] Error: Preallocated buffer capacity (%1) smaller than merged pixel image size (%2)").arg(buf.capacity).arg(totalPixels));
@@ -372,7 +378,7 @@ void MergeSaver::run()
                 } else {
                     fileNameStr = QString("merged_frame_%1.raw").arg(task.frameIndex, 5, 10, QChar('0'));
                     const QString fullPath = m_sessionDir + "/" + fileNameStr;
-                    FILE* f = fopen(fullPath.toLocal8Bit().constData(), "wb");
+                    FILE* f = openBinaryFile(fullPath);
                     if (f) {
                         size_t written = fwrite(targetBuf->memory, 1, targetBuf->bytesUsed, f);
                         fclose(f);

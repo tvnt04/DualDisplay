@@ -1,0 +1,17 @@
+file(GET_RUNTIME_DEPENDENCIES
+    LIBRARIES "@KYFGLIB_LIBRARY@" "@KYVP_IMAGE_PROCESSING_LIBRARY@"
+    DIRECTORIES "@KAYA_ROOT@/lib"
+    RESOLVED_DEPENDENCIES_VAR kaya_resolved
+    UNRESOLVED_DEPENDENCIES_VAR kaya_unresolved
+)
+
+foreach(dep IN LISTS kaya_resolved)
+    if(dep MATCHES "^@KAYA_ROOT@/lib/")
+        file(INSTALL DESTINATION "@PORTABLE_BUNDLE_LIB_DIR@/kaya"
+            TYPE SHARED_LIBRARY FILES "${dep}")
+    endif()
+endforeach()
+
+if(kaya_unresolved)
+    message(WARNING "Unresolved KAYA runtime dependencies: ${kaya_unresolved}")
+endif()

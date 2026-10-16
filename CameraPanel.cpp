@@ -325,12 +325,13 @@ bool CameraPanel::updateFrame(const FramePacket& pkt, bool fitToScreen, bool str
 
     const auto pixels = CameraWorker::displayPixelsWithoutMetadata(pkt);
     const int displayHeight = (pkt.rawData.empty() || pkt.height <= 1) ? pkt.height : (pkt.height - 1);
+    if (pkt.width <= 0 || displayHeight <= 0) return false;
+    const size_t expectedBytes = static_cast<size_t>(pkt.width) * static_cast<size_t>(displayHeight);
+    if (pixels.size() < expectedBytes) return false;
 
     if (!isOffline)
     {
         // ── Pixel stretch ────────────────────────────────────────────────
-        if (pixels.empty()) return false;
-
         const uint8_t* src = pixels.data();
         std::vector<uint8_t> buf;
         if (stretch && !pixels.empty())

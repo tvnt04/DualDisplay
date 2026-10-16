@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "NativeFile.h"
 
 #ifdef HAS_OFFLINE_VIEWER
 #include "OfflineViewer.h"
@@ -98,84 +99,156 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     resize(1920, 1080);
     buildUI();
 
-    for (int i = 0; i < 2; ++i)
-    {
-        m_workerThreads[i] = new QThread(this);
-        m_workers[i]       = new CameraWorker(i);
-        m_workers[i]->moveToThread(m_workerThreads[i]);
-        connect(m_workerThreads[i], &QThread::finished, m_workers[i], &QObject::deleteLater);
-        connect(m_workers[i], &CameraWorker::frameReady,    this, &MainWindow::onFrameReady,    Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::logMessage,    this, &MainWindow::onLogMessage,    Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::streamStarted, this, &MainWindow::onStreamStarted, Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::streamStopped, this, &MainWindow::onStreamStopped, Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::cameraOpened,  this, &MainWindow::onCameraOpened,  Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::paramsQueried, this, &MainWindow::onParamsQueried, Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::cameraClosed,  this, &MainWindow::onCameraClosed,  Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::errorOccurred, this, &MainWindow::onCameraError,   Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::temperatureReady, this, &MainWindow::onTemperatureReady, Qt::QueuedConnection);
-        connect(m_workers[i], &CameraWorker::fpsClamped, this, [this](int camIdx, double requestedFps, double maxFps) {
-            const QString msg = QString("CAM %1: %2 FPS exceeds camera max for current height (%3 FPS). Clamped to max %3 FPS.")
-                .arg(camIdx).arg(requestedFps, 0, 'f', 1).arg(maxFps, 0, 'f', 2);
-            if (statusBar()) statusBar()->showMessage(msg, 7000);
-            appendLogLine(msg);
-            m_cameraUiStates[camIdx].fps = QString::number(maxFps, 'f', 2);
-            applyCameraUiStateToWidgets(camIdx);
-        }, Qt::QueuedConnection);
-        m_workerThreads[i]->start();
-    }
+    m_cameraManager = new CameraManager(this);
+    m_captureController = new CaptureController(this);
+    m_playbackController = new PlaybackController(this);
+    m_calibrationEngine = new CalibrationEngine(this);
 
-    m_mergeSaver = new MergeSaver(this);
-    connect(m_mergeSaver, &MergeSaver::logMessage, this, &MainWindow::appendLogLine);
-    connect(m_mergeSaver, &MergeSaver::statsUpdated, this, &MainWindow::onMergeSaverStats);
+    // CameraManager wiring
+    connect(m_cameraManager, &CameraManager::frameReady,       this, &MainWindow::onFrameReady,       Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::logMessage,       this, &MainWindow::onLogMessage,       Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::streamStarted,    this, &MainWindow::onStreamStarted,    Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::streamStopped,    this, &MainWindow::onStreamStopped,    Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::cameraOpened,     this, &MainWindow::onCameraOpened,     Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::paramsQueried,    this, &MainWindow::onParamsQueried,    Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::cameraClosed,     this, &MainWindow::onCameraClosed,     Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::errorOccurred,    this, &MainWindow::onCameraError,      Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::temperatureReady, this, &MainWindow::onTemperatureReady, Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::fpsClamped,       this, [this](int camIdx, double requestedFps, double maxFps) {
+        const QString msg = QString("CAM %1: %2 FPS exceeds camera max for current height (%3 FPS). Clamped to max %3 FPS.")
+            .arg(camIdx).arg(requestedFps, 0, 'f', 1).arg(maxFps, 0, 'f', 2);
+        if (statusBar()) statusBar()->showMessage(msg, 7000);
+        appendLogLine(msg);
+        m_cameraUiStates[camIdx].fps = QString::number(maxFps, 'f', 2);
+        applyCameraUiStateToWidgets(camIdx);
+    }, Qt::QueuedConnection);
+    connect(m_cameraManager, &CameraManager::hardwareDetected, this, [this](int count, const QStringList& names) {
+        Q_UNUSED(count);
+        for (int slot = 0; slot < 2; ++slot) {
+            auto populateSourceCombo = [slot, &names](QComboBox* cb) {
+                if (!cb) return;
+                const int currentIdx = cb->currentIndex();
+                cb->blockSignals(true);
+                cb->clear();
+                for (int i = 0; i < names.size(); ++i) {
+                    cb->addItem(names[i]);
+                }
+                if (names.isEmpty()) {
+                    cb->addItem("No cameras found");
+                }
+                int targetIndex = (currentIdx >= 0 && currentIdx < cb->count()) ? currentIdx : slot;
+                if (targetIndex >= cb->count()) targetIndex = 0;
+                cb->setCurrentIndex(targetIndex);
+                cb->blockSignals(false);
+            };
+            populateSourceCombo(m_sidebarSourceCombos[slot]);
+            populateSourceCombo(m_topSourceCombos[slot]);
+            applyCameraSourceSelection(slot);
+        }
+    });
+    connect(m_cameraManager, &CameraManager::statusMessage, this, [this](const QString& msg, int timeoutMs) {
+        if (statusBar()) statusBar()->showMessage(msg, timeoutMs);
+    });
+
+    m_cameraManager->initialize();
+
+    // CaptureController wiring
+    connect(m_captureController, &CaptureController::saveStateChanged, this, [this](int idx, bool saving) {
+        m_saving[idx] = saving;
+        m_cameraManager->setSaving(idx, saving);
+        syncSidebarButtons(idx);
+    });
+    connect(m_captureController, &CaptureController::mergeSaveStateChanged, this, [this](bool saving) {
+        if (m_saveModeToggleBtn) {
+            m_saveModeToggleBtn->setChecked(saving);
+        }
+        for (int i = 0; i < 2; ++i) {
+            m_cameraManager->setSaving(i, saving);
+            syncSidebarButtons(i);
+        }
+    });
+    connect(m_captureController, &CaptureController::countdownUpdated, this, [this](int idx, const QString& countdownText) {
+        if (m_sidebarSaveBtns[idx]) m_sidebarSaveBtns[idx]->setText(countdownText);
+        if (m_topSaveBtns[idx]) m_topSaveBtns[idx]->setText(countdownText);
+    });
+    connect(m_captureController, &CaptureController::statusMessage, this, [this](const QString& msg, int timeoutMs) {
+        if (statusBar()) statusBar()->showMessage(msg, timeoutMs);
+    });
+    connect(m_captureController, &CaptureController::logMessage, this, &MainWindow::appendLogLine);
+    connect(m_captureController, &CaptureController::mergeStatsUpdated, this, &MainWindow::onMergeSaverStats);
+
+    // PlaybackController wiring
+    connect(m_playbackController, &PlaybackController::frameReady, this, &MainWindow::onFrameReady, Qt::QueuedConnection);
+    connect(m_playbackController, &PlaybackController::playbackStateChanged, this, [this](int idx, bool playing) {
+        m_playing[idx] = playing;
+        syncSidebarButtons(idx);
+        if (m_sidebarStateLabels[idx]) {
+            m_sidebarStateLabels[idx]->setText(playing ? "Playing" : (m_streaming[idx] ? "Streaming" : (m_connected[idx] ? "Connected" : "Disconnected")));
+        }
+        if (m_topStateLabels[idx]) {
+            m_topStateLabels[idx]->setText(playing ? "Playing" : (m_streaming[idx] ? "Streaming" : (m_connected[idx] ? "Connected" : "Disconnected")));
+        }
+    });
+    connect(m_playbackController, &PlaybackController::statusMessage, this, [this](const QString& msg, int timeoutMs) {
+        if (statusBar()) statusBar()->showMessage(msg, timeoutMs);
+    });
+    connect(m_playbackController, &PlaybackController::errorMessage, this, [this](const QString& title, const QString& msg) {
+        QMessageBox::critical(this, title, msg);
+    });
+
+    // CalibrationEngine wiring
+    connect(m_calibrationEngine, &CalibrationEngine::lineDelayCalculated, this, [this](int diffLines) {
+        setLineDelayValue(diffLines);
+        if (m_startCalibrationBtn) {
+            m_startCalibrationBtn->setText(" Start Calibration ");
+        }
+        if (statusBar()) {
+            statusBar()->showMessage(QString("Calibration complete! Line delay: %1 lines").arg(diffLines), 5000);
+        }
+    });
+    connect(m_calibrationEngine, &CalibrationEngine::statusMessageChanged, this, [this](const QString& msg) {
+        if (m_startCalibrationBtn) {
+            m_startCalibrationBtn->setText(msg);
+        }
+        if (statusBar()) statusBar()->showMessage(msg);
+    });
 
     loadSettings();
     if (m_darkModeBtn) {
         m_darkModeBtn->setChecked(m_darkMode);
     }
     applyStyles();
-    
+
     m_lastAppliedRegionOffset[0] = getActiveRegionOffset(0);
     m_lastAppliedRegionOffset[1] = getActiveRegionOffset(1);
-    
+
     // Auto-detect cameras on startup after main window is fully rendered on screen
     QTimer::singleShot(100, this, &MainWindow::detectCameras);
 }
 
 MainWindow::~MainWindow()
 {
-    if (m_mergeSaver)
-    {
-        m_mergeSaver->stopSession();
+    if (m_playbackController) {
+        m_playbackController->disconnect(this);
+        delete m_playbackController;
+        m_playbackController = nullptr;
     }
-
-    for (int i = 0; i < 2; ++i)
-    {
-        if (m_saveFiles[i])  { fclose(m_saveFiles[i]); m_saveFiles[i] = nullptr; }
-        if (m_playing[i])    stopPlayback(i, false);
-        
-        // Unconditionally stop the stream and close the camera on the worker thread.
-        // This is safe even if they are already stopped/closed.
-        QMetaObject::invokeMethod(m_workers[i], "closeCamera", Qt::BlockingQueuedConnection);
-
-        // Shut down the worker thread cleanly
-        m_workerThreads[i]->quit();
-        m_workerThreads[i]->wait();
-        m_workers[i] = nullptr;
+    if (m_captureController) {
+        m_captureController->disconnect(this);
+        delete m_captureController;
+        m_captureController = nullptr;
     }
-
-#if !USING_STUB
-    // Close grabbers uniquely to prevent double-close segmentation fault
-    std::set<FGHANDLE> closedFgs;
-    for (FGHANDLE fg : m_fgHandles)
-    {
-        if (fg != INVALID_FGHANDLE && closedFgs.find(fg) == closedFgs.end())
-        {
-            closedFgs.insert(fg);
-            try { KYFG_Close(fg); } catch (...) {}
-        }
+    if (m_cameraManager) {
+        m_cameraManager->disconnect(this);
+        m_cameraManager->shutdown();
+        delete m_cameraManager;
+        m_cameraManager = nullptr;
     }
-    m_fgHandles.clear();
-#endif
+    if (m_calibrationEngine) {
+        m_calibrationEngine->disconnect(this);
+        delete m_calibrationEngine;
+        m_calibrationEngine = nullptr;
+    }
 }
 
 // ── Build UI ─────────────────────────────────────────────────────────
@@ -890,9 +963,8 @@ void MainWindow::buildUI()
         auto applyLiveFps = [this, i]() {
             bool ok = false;
             const double fps = m_cameraUiStates[i].fps.toDouble(&ok);
-            if (ok && fps > 0.0 && m_connected[i]) {
-                QMetaObject::invokeMethod(m_workers[i], "setLiveFps", Qt::QueuedConnection,
-                    Q_ARG(double, fps));
+            if (ok && fps > 0.0 && m_connected[i] && m_cameraManager) {
+                m_cameraManager->setLiveFps(i, fps);
             }
         };
         connect(m_panels[i]->fpsEdit, &QLineEdit::textEdited, this, syncFpsText);
@@ -910,9 +982,8 @@ void MainWindow::buildUI()
         auto applyLiveExposure = [this, i]() {
             bool ok = false;
             const double exposureUs = m_cameraUiStates[i].exposure.toDouble(&ok);
-            if (ok && exposureUs > 0.0 && m_connected[i]) {
-                QMetaObject::invokeMethod(m_workers[i], "setLiveExposure", Qt::QueuedConnection,
-                    Q_ARG(double, exposureUs));
+            if (ok && exposureUs > 0.0 && m_connected[i] && m_cameraManager) {
+                m_cameraManager->setLiveExposure(i, exposureUs);
             }
         };
         connect(m_panels[i]->exposureEdit, &QLineEdit::textEdited, this, syncExposureText);
@@ -930,9 +1001,8 @@ void MainWindow::buildUI()
         auto applyLiveGain = [this, i]() {
             bool ok = false;
             const double gain = m_cameraUiStates[i].gain.toDouble(&ok);
-            if (ok && m_connected[i]) {
-                QMetaObject::invokeMethod(m_workers[i], "setLiveGain", Qt::QueuedConnection,
-                    Q_ARG(double, gain));
+            if (ok && m_connected[i] && m_cameraManager) {
+                m_cameraManager->setLiveGain(i, gain);
             }
         };
         connect(m_panels[i]->gainEdit, &QLineEdit::textEdited, this, syncGainText);
@@ -947,9 +1017,8 @@ void MainWindow::buildUI()
                 m_cameraUiStates[i].gain, value, m_cameraUiStates[i].savePath, m_cameraUiStates[i].saveFormat,
                 m_cameraUiStates[i].saveMode);
             const int pat = (value == "Gray Diagonal Ramp") ? 1 : 0;
-            if (m_connected[i]) {
-                QMetaObject::invokeMethod(m_workers[i], "setLiveTestPattern", Qt::QueuedConnection,
-                    Q_ARG(int, pat));
+            if (m_connected[i] && m_cameraManager) {
+                m_cameraManager->setLiveTestPattern(i, pat);
             }
         };
         connect(m_panels[i]->testPatternCombo, &QComboBox::currentTextChanged, this, applyLiveTestPattern);
@@ -1184,10 +1253,6 @@ void MainWindow::buildUI()
         m_topSaveFormatCombos[i]->setCurrentText(m_cameraUiStates[i].saveFormat);
         updateTdiUiVisibility(i);
 
-        m_streamCountdownTimers[i] = new QTimer(this);
-        m_streamCountdownTimers[i]->setInterval(250);
-        connect(m_streamCountdownTimers[i], &QTimer::timeout, this, [this, i]{ onStreamCountdown(i); });
-
         m_topControlScrolls[i] = new QScrollArea(m_topControlsHost);
         m_topControlScrolls[i]->setWidgetResizable(true);
         m_topControlScrolls[i]->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -1405,10 +1470,10 @@ void MainWindow::buildUI()
     connect(m_calibModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx){
         if (idx == 0) { // Direct Lines
             m_syncStackedWidget->setCurrentIndex(0);
-            if (m_calibrationMode) onStartCalibrationClicked();
+            if (m_calibrationEngine && m_calibrationEngine->isCalibrating()) onStartCalibrationClicked();
         } else if (idx == 1) { // Direct Time
             m_syncStackedWidget->setCurrentIndex(1);
-            if (m_calibrationMode) onStartCalibrationClicked();
+            if (m_calibrationEngine && m_calibrationEngine->isCalibrating()) onStartCalibrationClicked();
         } else { // Auto or Manual
             m_syncStackedWidget->setCurrentIndex(2);
         }
@@ -1499,12 +1564,9 @@ void MainWindow::buildUI()
     viewCapLay->addWidget(m_floatCam1Btn);
     tw(viewCap);
 
-    // Spacer + exit
+    // Spacer
     QWidget* sp = new QWidget(); sp->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     tw(sp);
-    QPushButton* ex = new QPushButton(" ✕ "); ex->setObjectName("exitBtn");
-    ex->setFixedSize(topBtnH, topBtnH);
-    connect(ex, &QPushButton::clicked, this, &MainWindow::close); tw(ex);
 }
 
 void MainWindow::appendLogLine(const QString& line)
@@ -1517,77 +1579,8 @@ void MainWindow::appendLogLine(const QString& line)
     if (!isTelemetry)
         m_logTerminal->appendPlainText(formattedLine);
 
-    for (int idx = 0; idx < 2; ++idx)
-    {
-        if (m_saving[idx] && !m_saveDirs[idx].isEmpty())
-        {
-            try {
-                if (!isTelemetry) {
-                    QFile logFile(m_saveDirs[idx] + "/session.log");
-                    if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-                    {
-                        QTextStream out(&logFile);
-                        out << formattedLine << "\n";
-                        logFile.close();
-                    }
-                }
-
-                // terminal.log is the clean full log (only real terminal prints)
-                if (!isTelemetry) {
-                    QFile termFile(m_saveDirs[idx] + "/terminal.log");
-                    if (termFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-                    {
-                        QTextStream out(&termFile);
-                        out << formattedLine << "\n";
-                        termFile.close();
-                    }
-                }
-            } catch (...) {}
-        }
-    }
-
-    if (!isTelemetry && m_mergeSaving && !m_mergedSaveDir.isEmpty())
-    {
-        try {
-            QFile logFile(m_mergedSaveDir + "/session.log");
-            if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-            {
-                QTextStream out(&logFile);
-                out << formattedLine << "\n";
-                logFile.close();
-            }
-
-            if (!isTelemetry) {
-                QFile termFile(m_mergedSaveDir + "/terminal.log");
-                if (termFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-                {
-                    QTextStream out(&termFile);
-                    out << formattedLine << "\n";
-                    termFile.close();
-                }
-            }
-        } catch (...) {}
-    }
-}
-
-void MainWindow::appendCaptureTelemetry(const QString& line)
-{
-    const QString ts = QDateTime::currentDateTime().toString("HH:mm:ss");
-    const QString formattedLine = QString("[%1] %2").arg(ts, line);
-    for (int idx = 0; idx < 2; ++idx) {
-        if (!m_saving[idx] || m_saveDirs[idx].isEmpty()) continue;
-        QFile logFile(m_saveDirs[idx] + "/session.log");
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-            QTextStream out(&logFile);
-            out << formattedLine << "\n";
-        }
-    }
-    if (m_mergeSaving && !m_mergedSaveDir.isEmpty()) {
-        QFile logFile(m_mergedSaveDir + "/session.log");
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-            QTextStream out(&logFile);
-            out << formattedLine << "\n";
-        }
+    if (m_captureController) {
+        m_captureController->appendTelemetry(formattedLine);
     }
 }
 
@@ -1900,8 +1893,10 @@ void MainWindow::refreshDisplay(int idx)
     if (!m_lastFrames[idx]) return;
     const FramePacket& pkt = *m_lastFrames[idx];
     const auto pixels = CameraWorker::displayPixelsWithoutMetadata(pkt);
-    if (pixels.empty()) return;
     const int displayHeight = (pkt.rawData.empty() || pkt.height <= 1) ? pkt.height : (pkt.height - 1);
+    if (pkt.width <= 0 || displayHeight <= 0) return;
+    const size_t expectedBytes = static_cast<size_t>(pkt.width) * static_cast<size_t>(displayHeight);
+    if (pixels.size() < expectedBytes) return;
 
     const uint8_t* src = pixels.data();
     std::vector<uint8_t> buf;
@@ -1950,7 +1945,7 @@ void MainWindow::refreshDisplay(int idx)
         }
     }
     
-    if (m_calibrationMode) {
+    if (m_calibrationEngine && m_calibrationEngine->isCalibrating()) {
         QPainter p(&px);
         p.setPen(QPen(Qt::red, 3));
         p.drawLine(0, px.height() / 2, px.width(), px.height() / 2);
@@ -1989,7 +1984,7 @@ void MainWindow::syncSidebarButtons(int idx)
     const bool isConn = m_connected[idx];
     const bool isStream = m_streaming[idx];
     const bool isMergedMode = (m_saveModeToggleBtn && m_saveModeToggleBtn->isChecked());
-    const bool isSaving = isMergedMode ? m_mergeSaving : m_saving[idx];
+    const bool isSaving = isMergedMode ? isMergeSaving() : m_saving[idx];
     if (m_panels[idx]) {
         m_panels[idx]->setSaving(isSaving);
         m_panels[idx]->saveBtn->setEnabled(isStream);
@@ -2031,7 +2026,7 @@ void MainWindow::syncSidebarButtons(int idx)
     setWidgetEnabled(m_topBinningBtns[idx], allowGeometryChange);
 
     const int otherIdx = 1 - idx;
-    const bool otherSaving = isMergedMode ? m_mergeSaving : m_saving[otherIdx];
+    const bool otherSaving = isMergedMode ? isMergeSaving() : m_saving[otherIdx];
     setWidgetEnabled(m_sidebarCopySettingsBtns[idx], !otherSaving);
     setWidgetEnabled(m_topCopySettingsBtns[idx], !otherSaving);
     if (m_panels[idx]) {
@@ -2162,7 +2157,7 @@ void MainWindow::syncSidebarButtons(int idx)
         m_detectBtn->setEnabled(!m_connected[0] && !m_connected[1]);
     }
     if (m_saveModeToggleBtn) {
-        const bool anySaving = m_saving[0] || m_saving[1] || m_mergeSaving;
+        const bool anySaving = m_saving[0] || m_saving[1] || isMergeSaving();
         m_saveModeToggleBtn->setEnabled(!anySaving);
     }
     if (m_startAllBtn) {
@@ -2171,7 +2166,7 @@ void MainWindow::syncSidebarButtons(int idx)
         m_startAllBtn->style()->unpolish(m_startAllBtn);
         m_startAllBtn->style()->polish(m_startAllBtn);
     }
-    bool anySaving = isMergedMode ? m_mergeSaving : (m_saving[0] || m_saving[1]);
+    bool anySaving = isMergedMode ? isMergeSaving() : (m_saving[0] || m_saving[1]);
 
     if (m_saveAllBtn) {
         m_saveAllBtn->setText(anySaving ? " ⏹ Stop All Saves " : " ⬇ Save All ");
@@ -2207,7 +2202,7 @@ void MainWindow::openRegionSettingsDialog(int idx)
     QLineEdit* offsetEdits[7] = {};
     for (int i = 0; i < 7; ++i)
     {
-          if (!m_connected[i] || !m_streaming[i]) return;
+        modeCombos[i] = new QComboBox(regionBox);
         modeCombos[i]->addItems({"On", "Off"});
         modeCombos[i]->setCurrentText(m_panels[idx]->regionModeCombos[i]->currentText());
 
@@ -2334,7 +2329,7 @@ void MainWindow::copyCameraSettings(int sourceCamIdx, int targetCamIdx)
         return;
 
     const bool isMergedMode = (m_saveModeToggleBtn && m_saveModeToggleBtn->isChecked());
-    const bool isSavingTarget = isMergedMode ? m_mergeSaving : m_saving[targetCamIdx];
+    const bool isSavingTarget = isMergedMode ? isMergeSaving() : m_saving[targetCamIdx];
 
     if (isSavingTarget)
     {
@@ -2355,23 +2350,23 @@ void MainWindow::copyCameraSettings(int sourceCamIdx, int targetCamIdx)
 
         applyCameraUiStateToWidgets(targetCamIdx);
 
-        if (m_connected[targetCamIdx] && m_workers[targetCamIdx])
+        if (m_connected[targetCamIdx] && m_cameraManager)
         {
             bool ok = false;
             double fps = m_cameraUiStates[targetCamIdx].fps.toDouble(&ok);
             if (ok && fps > 0.0)
-                QMetaObject::invokeMethod(m_workers[targetCamIdx], "setLiveFps", Qt::QueuedConnection, Q_ARG(double, fps));
+                m_cameraManager->setLiveFps(targetCamIdx, fps);
 
             double expUs = m_cameraUiStates[targetCamIdx].exposure.toDouble(&ok);
             if (ok && expUs > 0.0)
-                QMetaObject::invokeMethod(m_workers[targetCamIdx], "setLiveExposure", Qt::QueuedConnection, Q_ARG(double, expUs));
+                m_cameraManager->setLiveExposure(targetCamIdx, expUs);
 
             double gain = m_cameraUiStates[targetCamIdx].gain.toDouble(&ok);
             if (ok)
-                QMetaObject::invokeMethod(m_workers[targetCamIdx], "setLiveGain", Qt::QueuedConnection, Q_ARG(double, gain));
+                m_cameraManager->setLiveGain(targetCamIdx, gain);
 
             int pat = (m_cameraUiStates[targetCamIdx].testPattern == "Gray Diagonal Ramp") ? 1 : 0;
-            QMetaObject::invokeMethod(m_workers[targetCamIdx], "setLiveTestPattern", Qt::QueuedConnection, Q_ARG(int, pat));
+            m_cameraManager->setLiveTestPattern(targetCamIdx, pat);
         }
 
         saveSettings();
@@ -2437,45 +2432,19 @@ void MainWindow::copyCameraSettings(int sourceCamIdx, int targetCamIdx)
     appendLogLine(QString("[System] Applied all settings (geometry, FPS, Exp, Gain, TDI, Test, Regions, Save) from CAM %1 to CAM %2.").arg(sourceCamIdx).arg(targetCamIdx));
 }
 
-
 void MainWindow::applyCameraSourceSelection(int slot)
 {
-    if (slot < 0 || slot > 1) return;
-
-#if !USING_STUB
-    if (m_connected[slot] || m_streaming[slot])
-        return;
-
+    if (slot < 0 || slot > 1 || !m_cameraManager) return;
     int detectedIndex = -1;
     if (m_sidebarSourceCombos[slot])
-        detectedIndex = m_sidebarSourceCombos[slot]->currentData().toInt();
+        detectedIndex = m_sidebarSourceCombos[slot]->currentIndex();
+    else if (m_topSourceCombos[slot])
+        detectedIndex = m_topSourceCombos[slot]->currentIndex();
 
-    if (detectedIndex >= 0 && detectedIndex < m_detectedCameraCount)
-    {
-        m_camHandles[slot] = m_detectedCamHandles[detectedIndex];
-        m_workers[slot]->setFgHandle(m_detectedCamFgs[detectedIndex]);
-        m_workers[slot]->setCamHandle(m_camHandles[slot]);
-        m_panels[slot]->connectBtn->setEnabled(true);
+    m_cameraManager->assignCameraSource(slot, detectedIndex);
+    if (m_panels[slot] && m_panels[slot]->connectBtn) {
+        m_panels[slot]->connectBtn->setEnabled(detectedIndex >= 0);
     }
-    else
-    {
-        m_camHandles[slot] = INVALID_CAMHANDLE;
-        m_workers[slot]->setCamHandle(INVALID_CAMHANDLE);
-        m_panels[slot]->connectBtn->setEnabled(false);
-    }
-#else
-    if (m_sidebarSourceCombos[slot] && m_sidebarSourceCombos[slot]->currentData().toInt() >= 0)
-    {
-        m_workers[slot]->setFgHandle(0);
-        m_workers[slot]->setCamHandle(slot);
-        m_panels[slot]->connectBtn->setEnabled(true);
-    }
-    else
-    {
-        m_panels[slot]->connectBtn->setEnabled(false);
-    }
-#endif
-
     syncSidebarButtons(slot);
 }
 
@@ -2604,7 +2573,7 @@ void MainWindow::updateCameraUiState(int idx, const QString& width, const QStrin
 
 void MainWindow::updateWorkerParams(int idx)
 {
-    if (idx < 0 || idx > 1 || !m_workers[idx]) return;
+    if (idx < 0 || idx > 1 || !m_cameraManager) return;
 
     CameraParams params = m_panels[idx]->collectParams();
     params.width = m_cameraUiStates[idx].width.toInt();
@@ -2622,8 +2591,7 @@ void MainWindow::updateWorkerParams(int idx)
     params.tdiFrameCount = m_cameraUiStates[idx].tdiFrameCount.toInt();
     if (params.tdiFrameCount <= 0) params.tdiFrameCount = 10;
     params.reverseX = m_cameraUiStates[idx].reverseX;
-    params.reverseY = m_cameraUiStates[idx].reverseY;
-    m_workers[idx]->setParams(params);
+    m_cameraManager->applyWorkerParams(idx, params);
 }
 
 void MainWindow::updateCameraAdvancedState(int idx, const QString& tdiMode, const QString& tdiStages,
@@ -2658,22 +2626,19 @@ void MainWindow::updateCameraAdvancedState(int idx, const QString& tdiMode, cons
     state.saveDuration = saveDuration;
     applyCameraUiStateToWidgets(idx);
 
-    if (m_connected[idx] && m_workers[idx]) {
+    if (m_connected[idx] && m_cameraManager) {
         if (revXChanged) {
-            QMetaObject::invokeMethod(m_workers[idx], "setLiveReverseX", Qt::QueuedConnection,
-                Q_ARG(bool, reverseX));
+            m_cameraManager->setLiveReverseX(idx, reverseX);
         }
         if (revYChanged) {
-            QMetaObject::invokeMethod(m_workers[idx], "setLiveReverseY", Qt::QueuedConnection,
-                Q_ARG(bool, reverseY));
+            m_cameraManager->setLiveReverseY(idx, reverseY);
         }
         if (tdiChanged) {
             const int mode = (state.tdiMode == "TDI") ? 2 : ((state.tdiMode == "Record") ? 1 : 0);
             const int stages = state.tdiStages.toInt();
             const int yShift = state.tdiYShift.toInt();
             const int frameCount = state.tdiFrameCount.toInt();
-            QMetaObject::invokeMethod(m_workers[idx], "setLiveTdi", Qt::QueuedConnection,
-                Q_ARG(int, mode), Q_ARG(int, stages), Q_ARG(int, yShift), Q_ARG(int, frameCount));
+            m_cameraManager->setLiveTdi(idx, mode, stages, yShift, frameCount);
         }
     }
 }
@@ -2721,92 +2686,57 @@ void MainWindow::updateTdiUiVisibility(int idx)
 // ── Per-camera slots ──────────────────────────────────────────────────
 void MainWindow::onConnectClicked(int idx)
 {
+    if (idx < 0 || idx > 1 || !m_cameraManager) return;
     if (!m_connected[idx])
     {
-#if !USING_STUB
         applyCameraSourceSelection(idx);
-        if (m_camHandles[idx] == INVALID_CAMHANDLE)
-        {
-            detectCameras();
-            applyCameraSourceSelection(idx);
-            if (m_camHandles[idx] == INVALID_CAMHANDLE)
-            {
-                QMessageBox::warning(this, "Connect", QString("Select a detected source for CAM %1 first.").arg(idx));
-                return;
-            }
-        }
-#endif
         int newOffset = getActiveRegionOffset(idx);
         int oldOffset = m_lastAppliedRegionOffset[idx];
         if (newOffset != oldOffset) {
             int diff = newOffset - oldOffset;
-            // If CAM 1 (idx == 1) offset increased, delay increases.
-            // If CAM 0 (idx == 0) offset increased, delay decreases.
             int delayAdjustment = (idx == 1) ? diff : -diff;
-            
             int oldDelay = getLineDelayValue();
-            int newDelay = oldDelay + delayAdjustment;
-            if (newDelay < 0) newDelay = 0;
+            int newDelay = std::max(0, oldDelay + delayAdjustment);
             setLineDelayValue(newDelay);
-            
-            statusBar()->showMessage(QString("Region offset changed by %1 lines. Adjusted Line Delay from %2 to %3.")
-                .arg(delayAdjustment).arg(oldDelay).arg(newDelay), 5000);
+            if (statusBar()) {
+                statusBar()->showMessage(QString("Region offset changed by %1 lines. Adjusted Line Delay from %2 to %3.")
+                    .arg(delayAdjustment).arg(oldDelay).arg(newDelay), 5000);
+            }
             m_lastAppliedRegionOffset[idx] = newOffset;
         }
 
         updateWorkerParams(idx);
-        QMetaObject::invokeMethod(m_workers[idx], "openCamera", Qt::QueuedConnection);
+        m_cameraManager->connectCamera(idx);
     }
     else
     {
-        if (m_streaming[idx])
-            QMetaObject::invokeMethod(m_workers[idx], "stopStream",  Qt::QueuedConnection);
-        QMetaObject::invokeMethod(m_workers[idx], "closeCamera", Qt::QueuedConnection);
+        m_cameraManager->disconnectCamera(idx);
     }
 }
 
 void MainWindow::onStartClicked(int idx)
 {
+    if (idx < 0 || idx > 1 || !m_cameraManager) return;
     if (!m_connected[idx])
-    { QMessageBox::information(this,"Start",QString("Connect Camera %1 first.").arg(idx)); return; }
-
-    if (m_streaming[idx])
     {
-        if (m_streamCountdownTimers[idx])
-            m_streamCountdownTimers[idx]->stop();
-        QMetaObject::invokeMethod(m_workers[idx], "stopStream", Qt::QueuedConnection);
+        QMessageBox::information(this, "Start", QString("Connect Camera %1 first.").arg(idx));
         return;
     }
 
-    if (m_cameraUiStates[idx].stopAfterEnabled)
+    if (m_streaming[idx])
     {
-        const double duration = m_cameraUiStates[idx].saveDuration.toDouble();
-        if (duration > 0.0)
-        {
-            m_streamEndMs[idx] = QDateTime::currentMSecsSinceEpoch() + qint64(duration * 1000.0);
-            if (m_streamCountdownTimers[idx])
-                m_streamCountdownTimers[idx]->start();
-        }
-    }
-    else if (m_streamCountdownTimers[idx])
-    {
-        m_streamCountdownTimers[idx]->stop();
-        m_streamEndMs[idx] = 0;
+        m_cameraManager->stopStream(idx);
+        return;
     }
 
-    if (!m_streaming[idx])
-    {
-        updateWorkerParams(idx);
-    }
-
-    QMetaObject::invokeMethod(m_workers[idx], "startStream", Qt::QueuedConnection);
+    updateWorkerParams(idx);
+    m_cameraManager->startStream(idx);
 }
 
 void MainWindow::onSaveClicked(int idx)
 {
     if (m_saveModeToggleBtn && m_saveModeToggleBtn->isChecked()) {
-        if (!m_mergeSaving) {
-            // Merged saving requires both cameras to stream. Start stream for connected cameras if needed.
+        if (m_captureController && !m_captureController->isMergeSaving()) {
             for (int i = 0; i < 2; ++i) {
                 if (m_connected[i] && !m_streaming[i]) {
                     onStartClicked(i);
@@ -2817,334 +2747,45 @@ void MainWindow::onSaveClicked(int idx)
         return;
     }
 
-    if (!m_streaming[idx])
-    { QMessageBox::information(this,"Save",QString("Start Camera %1 first.").arg(idx)); return; }
-    if (!m_saving[idx])
-    {
-        QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-        m_saveDirs[idx] = m_cameraUiStates[idx].savePath
-                          + QString("/Cam%1_%2").arg(idx).arg(ts);
-        QDir().mkpath(m_saveDirs[idx]);
-
-        const QString saveMode = m_cameraUiStates[idx].saveMode;
-        m_saveFrameCount[idx] = 0;
-        m_firstSavedFrameMs[idx] = 0;
-        m_lastSavedFrameMs[idx] = 0;
-        m_savedFrameWidth[idx] = 0;
-        m_savedFrameHeight[idx] = 0;
-        m_emptyRawFrameSkips[idx] = 0;
-
-        const QString saveFormat = m_cameraUiStates[idx].saveFormat;
-        if (saveFormat == ".raw" && saveMode == "Single File")
-        {
-            m_saveFiles[idx] = fopen(
-                (m_saveDirs[idx]+"/Capture.raw").toLocal8Bit().constData(), "wb");
-            if (!m_saveFiles[idx])
-            {
-                QMessageBox::critical(this, "Save Error", QString("Failed to open save file in %1").arg(m_saveDirs[idx]));
-                return;
-            }
-        }
-        else
-        {
-            m_saveFiles[idx] = nullptr;
-        }
-
-        bool workerSavingEnabled = true;
-        if (m_workers[idx])
-        {
-            const Qt::ConnectionType connectionType =
-                (m_workers[idx]->thread() == QThread::currentThread())
-                    ? Qt::DirectConnection
-                    : Qt::BlockingQueuedConnection;
-            workerSavingEnabled = QMetaObject::invokeMethod(
-                m_workers[idx], "setSaving", connectionType, Q_ARG(bool, true));
-        }
-
-        if (!workerSavingEnabled)
-        {
-            if (m_saveFiles[idx])
-            {
-                fclose(m_saveFiles[idx]);
-                m_saveFiles[idx] = nullptr;
-            }
-            QMessageBox::critical(this, "Save Error", QString("Failed to enable raw capture for Camera %1.").arg(idx));
-            return;
-        }
-
-        m_saving[idx] = true;
-        writeSaveMetadata(idx, true);
-        appendLogLine(QString("[Cam%1] Save started").arg(idx));
-        const QString sensorVal = m_lastSensorTemp[idx] > -999.0f
-            ? QString::number(m_lastSensorTemp[idx], 'f', 1) : "—";
-        const QString grabberVal = m_lastGrabberTemp[idx] > -999.0f
-            ? QString::number(m_lastGrabberTemp[idx], 'f', 1) : "—";
-        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
-        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
-        m_panels[idx]->setSaving(true);
-        syncSidebarButtons(idx);
-        statusBar()->showMessage(QString("[Cam%1] Save started.").arg(idx), 3000);
+    if (!m_streaming[idx]) {
+        QMessageBox::information(this, "Save", QString("Start Camera %1 first.").arg(idx));
+        return;
     }
-    else
-    {
-        stopSave(idx, false);
+
+    if (!m_captureController) return;
+
+    if (!m_captureController->isSaving(idx)) {
+        CaptureSaveParams params;
+        params.savePath = m_cameraUiStates[idx].savePath;
+        params.saveFormat = m_cameraUiStates[idx].saveFormat;
+        params.saveMode = m_cameraUiStates[idx].saveMode;
+        params.width = m_cameraUiStates[idx].width.toInt();
+        params.height = m_cameraUiStates[idx].height.toInt();
+        params.fps = m_cameraUiStates[idx].fps.toDouble();
+        params.exposure = m_cameraUiStates[idx].exposure.toDouble();
+        params.gain = m_cameraUiStates[idx].gain.toDouble();
+        params.tdiMode = m_cameraUiStates[idx].tdiMode;
+        params.tdiStages = m_cameraUiStates[idx].tdiStages.toInt();
+        params.tdiFrameCount = m_cameraUiStates[idx].tdiFrameCount.toInt();
+        params.stopAfterEnabled = m_cameraUiStates[idx].stopAfterEnabled;
+        params.saveDuration = m_cameraUiStates[idx].saveDuration.toDouble();
+        params.sensorTemp = m_lastSensorTemp[idx];
+        params.grabberTemp = m_lastGrabberTemp[idx];
+
+        QString initialLogText = m_logTerminal ? m_logTerminal->toPlainText() : QString();
+        if (!m_captureController->startSave(idx, params, initialLogText)) {
+            QMessageBox::critical(this, "Save Error", "Failed to start capture recording.");
+        }
+    } else {
+        m_captureController->stopSave(idx, false);
     }
 }
 
 void MainWindow::stopSave(int idx, bool completed)
 {
-    Q_UNUSED(completed);
-    if (m_saving[idx])
-        appendLogLine(QString("[Cam%1] Save stopped").arg(idx));
-    m_saving[idx] = false;
-    if (m_workers[idx])
-        QMetaObject::invokeMethod(m_workers[idx], "setSaving",
-                                  Qt::QueuedConnection, Q_ARG(bool, false));
-
-    if (m_saveFiles[idx])
-    {
-        fclose(m_saveFiles[idx]);
-        m_saveFiles[idx] = nullptr;
+    if (m_captureController) {
+        m_captureController->stopSave(idx, completed);
     }
-    if (m_panels[idx])
-        m_panels[idx]->setSaving(false);
-    syncSidebarButtons(idx);
-    
-    if (m_logTerminal && !m_saveDirs[idx].isEmpty()) {
-        QFile logFile(m_saveDirs[idx] + "/terminal.log");
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-            QTextStream out(&logFile);
-            out << m_logTerminal->toPlainText();
-            logFile.close();
-        }
-    }
-
-    writeSaveMetadata(idx);
-
-    statusBar()->showMessage(QString("[Cam%1] Save stopped.").arg(idx), 3000);
-}
-
-void MainWindow::writeSaveMetadata(int idx, bool isCaptureStart)
-{
-    if (idx < 0 || idx > 1) return;
-
-    const FramePacketPtr& latestFrame = m_lastFrames[idx];
-    const int frameWidth = m_savedFrameWidth[idx] > 0 ? m_savedFrameWidth[idx]
-        : (latestFrame ? latestFrame->width : m_cameraUiStates[idx].width.toInt());
-    const int latestDisplayHeight = latestFrame
-        ? ((!latestFrame->rawData.empty() && latestFrame->height > 1) ? latestFrame->height - 1 : latestFrame->height)
-        : m_cameraUiStates[idx].height.toInt();
-    const int bandHeight = m_savedFrameHeight[idx] > 0 ? m_savedFrameHeight[idx] : latestDisplayHeight;
-    int tdiStages = m_cameraUiStates[idx].tdiStages.toInt();
-    int tdiModeInt = 0;
-    if (m_cameraUiStates[idx].tdiMode == "Record") tdiModeInt = 1;
-    else if (m_cameraUiStates[idx].tdiMode == "TDI") tdiModeInt = 2;
-
-    int regionHeight = bandHeight;
-    if (tdiModeInt == 2 && tdiStages > 0) {
-        regionHeight = bandHeight * tdiStages;
-    }
-
-    QString capturesFolder = m_saveDirs[idx];
-    if (capturesFolder.startsWith(QDir::currentPath() + "/")) {
-        capturesFolder = capturesFolder.mid(QDir::currentPath().length() + 1);
-    }
-    if (!capturesFolder.endsWith("/")) {
-        capturesFolder += "/";
-    }
-
-    double sensorTemp = (m_lastSensorTemp[idx] > -999.0f) ? m_lastSensorTemp[idx] : 0.0;
-    double coreTemp = (m_lastGrabberTemp[idx] > -999.0f) ? m_lastGrabberTemp[idx] : 0.0;
-
-    int totalFrames = m_saveFrameCount[idx];
-    int totalHeight = bandHeight * totalFrames;
-    double recordedFps = m_cameraUiStates[idx].fps.toDouble();
-    const qint64 captureSpanMs = m_lastSavedFrameMs[idx] - m_firstSavedFrameMs[idx];
-    const bool fpsMeasured = totalFrames > 1 && captureSpanMs > 0;
-    if (fpsMeasured) {
-        recordedFps = static_cast<double>(totalFrames - 1) * 1000.0 / captureSpanMs;
-    }
-
-    QJsonObject metadata;
-    metadata["BandHeight"] = bandHeight;
-    metadata["CapturesFolder"] = capturesFolder;
-    metadata["ExposureTime"] = m_cameraUiStates[idx].exposure.toDouble();
-    metadata["FPS"] = recordedFps;
-    metadata["ConfiguredFPS"] = m_cameraUiStates[idx].fps.toDouble();
-    metadata["FPSMeasured"] = fpsMeasured;
-    metadata["PixelEncoding"] = m_cameraUiStates[idx].saveFormat == ".bmp" ? "Gray8" : "CameraRaw";
-    metadata["Gain"] = m_cameraUiStates[idx].gain.toDouble();
-    metadata["Height"] = totalHeight;
-    metadata["RegionHeight"] = regionHeight;
-    metadata["TDIMode"] = tdiModeInt;
-    metadata["TDIStages"] = (tdiModeInt == 2) ? tdiStages : 0;
-    metadata["TDIFrameCount"] = (tdiModeInt == 1) ? m_cameraUiStates[idx].tdiFrameCount.toInt() : 0;
-    metadata["TotalFrames"] = totalFrames;
-    metadata["Width"] = frameWidth;
-    metadata["coreTemperature"] = coreTemp;
-    metadata["sensorTemperature"] = sensorTemp;
-
-    QFile metadataFile(m_saveDirs[idx] + "/metadata.json");
-    if (metadataFile.open(QIODevice::WriteOnly | QIODevice::Truncate))
-    {
-        metadataFile.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
-        metadataFile.close();
-    }
-
-    if (isCaptureStart && m_logTerminal) {
-        // Initialize session.log (playback log)
-        QFile logFile(m_saveDirs[idx] + "/session.log");
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream out(&logFile);
-            out << m_logTerminal->toPlainText();
-            if (!m_logTerminal->toPlainText().endsWith("\n") && !m_logTerminal->toPlainText().isEmpty()) {
-                out << "\n";
-            }
-            logFile.close();
-        }
-
-        // Initialize terminal.log (clean full log)
-        QFile termFile(m_saveDirs[idx] + "/terminal.log");
-        if (termFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream out(&termFile);
-            out << m_logTerminal->toPlainText();
-            if (!m_logTerminal->toPlainText().endsWith("\n") && !m_logTerminal->toPlainText().isEmpty()) {
-                out << "\n";
-            }
-            termFile.close();
-        }
-    }
-}
-
-bool MainWindow::loadPlaybackMetadata(const QString& path, int idx)
-{
-    if (idx < 0 || idx > 1) return false;
-    QFileInfo info(path);
-    QString jsonPath;
-    if (info.isDir())
-        jsonPath = QDir(info.absoluteFilePath()).filePath("metadata.json");
-    else
-        jsonPath = QDir(info.absolutePath()).filePath("metadata.json");
-
-    QFile metadataFile(jsonPath);
-    if (!metadataFile.exists() || !metadataFile.open(QIODevice::ReadOnly))
-        return false;
-
-    const QByteArray raw = metadataFile.readAll();
-    metadataFile.close();
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(raw, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
-        return false;
-
-    const QJsonObject obj = doc.object();
-    QString width = obj.value("Width").toVariant().toString();
-    if (width.isEmpty()) width = obj.value("width").toVariant().toString();
-
-    QString height = obj.value("BandHeight").toVariant().toString();
-    if (height.isEmpty()) height = obj.value("height").toVariant().toString();
-
-    QString fps = obj.value("FPS").toVariant().toString();
-    if (fps.isEmpty()) fps = obj.value("fps").toVariant().toString();
-
-    QString saveFormat = obj.value("saveFormat").toString();
-    if (saveFormat.isEmpty()) {
-        if (info.isDir()) {
-            QDir dir(path);
-            if (dir.exists("Capture.raw")) saveFormat = ".raw";
-            else {
-                QStringList bmpFiles = dir.entryList({"*.bmp"}, QDir::Files);
-                if (!bmpFiles.isEmpty()) saveFormat = ".bmp";
-                else saveFormat = ".raw";
-            }
-        } else {
-            saveFormat = "." + info.suffix().toLower();
-        }
-    }
-
-    QString saveMode = obj.value("saveMode").toString();
-    if (saveMode.isEmpty()) {
-        if (info.isDir()) {
-            QDir dir(path);
-            if (dir.exists("Capture.raw")) saveMode = "Single File";
-            else saveMode = "Image Sequence";
-        } else {
-            saveMode = "Single File";
-        }
-    }
-
-    if (!width.isEmpty() && !height.isEmpty())
-    {
-        updateCameraUiState(idx,
-            width,
-            height,
-            fps.isEmpty() ? m_cameraUiStates[idx].fps : fps,
-            m_cameraUiStates[idx].exposure,
-            m_cameraUiStates[idx].gain,
-            m_cameraUiStates[idx].testPattern,
-            m_cameraUiStates[idx].savePath,
-            saveFormat,
-            saveMode,
-            m_cameraUiStates[idx].rawPath);
-        return true;
-    }
-    return false;
-}
-
-
-
-
-
-void MainWindow::onStreamCountdown(int idx)
-{
-    if (m_streamEndMs[idx] <= 0) return;
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now >= m_streamEndMs[idx])
-    {
-        if (m_streamCountdownTimers[idx])
-            m_streamCountdownTimers[idx]->stop();
-        if (m_streaming[idx])
-            QMetaObject::invokeMethod(m_workers[idx], "stopStream", Qt::QueuedConnection);
-        if (m_panels[idx])
-        {
-            QString base = m_panels[idx]->statusLabel->text();
-            int suffixPos = base.indexOf(" | Stop:");
-            if (suffixPos >= 0) base = base.left(suffixPos);
-            m_panels[idx]->statusLabel->setText(base + QString(" | Stop: 0.0s"));
-        }
-        if (m_viewStatusLabels[idx])
-            m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
-        return;
-    }
-
-    const double remaining = double(m_streamEndMs[idx] - now) / 1000.0;
-    if (m_panels[idx])
-    {
-        QString base = m_panels[idx]->statusLabel->text();
-        int suffixPos = base.indexOf(" | Stop:");
-        if (suffixPos >= 0) base = base.left(suffixPos);
-        m_panels[idx]->statusLabel->setText(base + QString(" | Stop: %1s").arg(remaining, 0, 'f', 1));
-    }
-    if (m_viewStatusLabels[idx])
-        m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
-}
-
-void MainWindow::stopStreamCountdown(int idx)
-{
-    if (idx < 0 || idx > 1) return;
-    if (m_streamCountdownTimers[idx])
-        m_streamCountdownTimers[idx]->stop();
-    m_streamEndMs[idx] = 0;
-    
-    if (m_panels[idx])
-    {
-        QString base = m_panels[idx]->statusLabel->text();
-        int suffixPos = base.indexOf(" | Stop:");
-        if (suffixPos >= 0) base = base.left(suffixPos);
-        m_panels[idx]->statusLabel->setText(base);
-    }
-    if (m_viewStatusLabels[idx])
-        m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
 }
 
 void MainWindow::onBrowseRaw(int idx)
@@ -3188,256 +2829,45 @@ void MainWindow::onBrowseSave(int idx)
 
 void MainWindow::stopPlayback(int idx, bool completed)
 {
-    if (idx < 0 || idx > 1) return;
-    m_playing[idx] = false;
-    if (m_playbackTimers[idx])
-        m_playbackTimers[idx]->stop();
-    if (m_playbackFile[idx])
-    {
-        if (m_playbackFile[idx]->isOpen())
-            m_playbackFile[idx]->close();
-        delete m_playbackFile[idx];
-        m_playbackFile[idx] = nullptr;
+    if (m_playbackController) {
+        m_playbackController->stopPlayback(idx, completed);
     }
-    m_playbackFiles[idx].clear();
-    m_playbackIndex[idx] = 0;
-    m_playbackFrameSize[idx] = 0;
-    m_playbackRawSequence[idx] = false;
-    if (m_panels[idx])
-        m_panels[idx]->setPlaying(false);
-    if (completed)
-        statusBar()->showMessage(QString("[Cam%1] Playback complete.").arg(idx), 5000);
-    else
-        statusBar()->showMessage(QString("[Cam%1] Playback stopped.").arg(idx), 3000);
-}
-
-void MainWindow::onPlaybackTimer(int idx)
-{
-    if (idx < 0 || idx > 1 || !m_playing[idx]) return;
-    if (!m_playbackFiles[idx].isEmpty())
-    {
-        if (m_playbackIndex[idx] >= m_playbackFiles[idx].size())
-        {
-            stopPlayback(idx, true);
-            return;
-        }
-
-        const QString path = m_playbackFiles[idx].at(m_playbackIndex[idx]++);
-        const QString extension = QFileInfo(path).suffix().toLower();
-        
-        auto pkt = std::make_shared<FramePacket>();
-        pkt->cameraIndex = idx;
-        
-        if (extension == "raw")
-        {
-            QFile file(path);
-            if (!file.open(QIODevice::ReadOnly))
-            {
-                stopPlayback(idx, false);
-                QMessageBox::critical(this, "Playback Error", QString("Unable to open %1").arg(path));
-                return;
-            }
-            const int width = m_cameraUiStates[idx].width.toInt();
-            const int height = m_cameraUiStates[idx].height.toInt();
-            const qint64 bytesPerFrame = qint64(width) * qint64(height);
-            if (bytesPerFrame <= 0)
-            {
-                file.close(); stopPlayback(idx, false);
-                QMessageBox::critical(this, "Playback Error", "Invalid frame dimensions for raw playback.");
-                return;
-            }
-            QByteArray raw = file.read(bytesPerFrame);
-            file.close();
-            if (raw.size() != bytesPerFrame)
-            {
-                stopPlayback(idx, true);
-                return;
-            }
-            pkt->width = width;
-            pkt->height = height;
-            pkt->pixels.assign(reinterpret_cast<const uint8_t*>(raw.constData()),
-                               reinterpret_cast<const uint8_t*>(raw.constData()) + raw.size());
-        }
-        else
-        {
-            QImage img(path);
-            if (img.isNull())
-            {
-                stopPlayback(idx, false);
-                QMessageBox::critical(this, "Playback Error", QString("Unable to load image %1").arg(path));
-                return;
-            }
-            if (img.format() != QImage::Format_Grayscale8)
-                img = img.convertToFormat(QImage::Format_Grayscale8);
-            pkt->width = img.width();
-            pkt->height = img.height();
-            pkt->pixels.assign(img.constBits(), img.constBits() + img.sizeInBytes());
-        }
-
-        pkt->frameId = m_playbackIndex[idx]; // Use 1-based sequential index
-        
-        onFrameReady(pkt);
-        return;
-    }
-
-    if (m_playbackFile[idx])
-    {
-        if (!m_playbackFile[idx]->isOpen())
-        {
-            stopPlayback(idx, false);
-            return;
-        }
-
-        qint64 targetPos = qint64(m_playbackIndex[idx]) * m_playbackFrameSize[idx];
-        if (m_playbackFile[idx]->pos() != targetPos) {
-            m_playbackFile[idx]->seek(targetPos);
-        }
-
-        QByteArray raw = m_playbackFile[idx]->read(m_playbackFrameSize[idx]);
-        if (raw.size() != m_playbackFrameSize[idx])
-        {
-            stopPlayback(idx, true);
-            return;
-        }
-
-        auto pkt = std::make_shared<FramePacket>();
-        pkt->cameraIndex = idx;
-        pkt->width = m_cameraUiStates[idx].width.toInt();
-        pkt->height = m_cameraUiStates[idx].height.toInt();
-        m_playbackIndex[idx]++;
-        pkt->frameId = m_playbackIndex[idx]; // Use 1-based sequential index
-        pkt->pixels.assign(reinterpret_cast<const uint8_t*>(raw.constData()),
-                           reinterpret_cast<const uint8_t*>(raw.constData()) + raw.size());
-        
-        onFrameReady(pkt);
-        return;
-    }
-
-    stopPlayback(idx, true);
 }
 
 void MainWindow::onPlaybackClicked(int idx)
 {
-    if (idx < 0 || idx > 1) return;
-    if (m_playing[idx])
-    {
-        stopPlayback(idx, false);
-        return;
-    }
-    if (m_streaming[idx])
-    {
-        QMessageBox::information(this, "Playback", QString("Stop live streaming on Camera %1 first.").arg(idx));
+    if (idx < 0 || idx > 1 || !m_playbackController) return;
+
+    if (m_playbackController->isPlaying(idx)) {
+        m_playbackController->stopPlayback(idx, false);
         return;
     }
 
-    const QString path = m_cameraUiStates[idx].rawPath.trimmed();
-    if (path.isEmpty())
-    {
-        QMessageBox::information(this, "Playback", "Select a saved raw/bmp file or directory first.");
+    if (m_streaming[idx]) {
+        QMessageBox::information(this, "Playback", QString("Stop live stream for Camera %1 first.").arg(idx));
         return;
     }
 
-    QFileInfo info(path);
-    if (!info.exists())
-    {
-        QMessageBox::critical(this, "Playback Error", QString("Playback source does not exist: %1").arg(path));
-        return;
+    QString rawPath = m_cameraUiStates[idx].rawPath;
+    if (rawPath.isEmpty()) {
+        onBrowseRaw(idx);
+        rawPath = m_cameraUiStates[idx].rawPath;
+        if (rawPath.isEmpty()) return;
     }
 
-    loadPlaybackMetadata(path, idx);
-    const double fps = std::max(0.001, m_cameraUiStates[idx].fps.toDouble());
-    if (fps <= 0.0)
-    {
-        QMessageBox::critical(this, "Playback Error", "Invalid FPS value for playback.");
-        return;
+    PlaybackMetadata meta;
+    if (PlaybackController::loadMetadata(rawPath, meta)) {
+        if (!meta.width.isEmpty())  m_cameraUiStates[idx].width = meta.width;
+        if (!meta.height.isEmpty()) m_cameraUiStates[idx].height = meta.height;
+        if (!meta.fps.isEmpty())    m_cameraUiStates[idx].fps = meta.fps;
+        applyCameraUiStateToWidgets(idx);
     }
 
-    if (!m_playbackTimers[idx])
-    {
-        m_playbackTimers[idx] = new QTimer(this);
-        connect(m_playbackTimers[idx], &QTimer::timeout, this, [this, idx](){ onPlaybackTimer(idx); });
-    }
-    m_playbackTimers[idx]->setInterval(int(1000.0 / fps));
+    int width = m_cameraUiStates[idx].width.toInt();
+    int height = m_cameraUiStates[idx].height.toInt();
+    double fps = m_cameraUiStates[idx].fps.toDouble();
 
-    if (info.isDir())
-    {
-        QDir dir(path);
-        if (dir.exists("Capture.raw")) {
-            // It's a single file capture directory
-            const int width = m_cameraUiStates[idx].width.toInt();
-            const int height = m_cameraUiStates[idx].height.toInt();
-            if (width <= 0 || height <= 0) {
-                QMessageBox::critical(this, "Playback Error", "Width and height must be set for raw playback.");
-                return;
-            }
-            m_playbackFile[idx] = new QFile(dir.absoluteFilePath("Capture.raw"), this);
-            if (!m_playbackFile[idx]->open(QIODevice::ReadOnly)) {
-                QMessageBox::critical(this, "Playback Error", QString("Unable to open Capture.raw in %1").arg(path));
-                delete m_playbackFile[idx];
-                m_playbackFile[idx] = nullptr;
-                return;
-            }
-            m_playbackFrameSize[idx] = qint64(width) * qint64(height);
-            m_playbackRawSequence[idx] = true;
-        } else {
-            // It's an image sequence directory
-            QStringList rawFiles = dir.entryList({"*.raw"}, QDir::Files, QDir::Name);
-            QStringList bmpFiles = dir.entryList({"*.bmp"}, QDir::Files, QDir::Name);
-            QStringList files;
-            for (const QString& file : rawFiles) files << dir.absoluteFilePath(file);
-            for (const QString& file : bmpFiles) files << dir.absoluteFilePath(file);
-            if (files.isEmpty()) {
-                QMessageBox::critical(this, "Playback Error", QString("No .raw or .bmp files found in %1").arg(path));
-                return;
-            }
-            m_playbackFiles[idx] = files;
-        }
-    }
-    else if (info.isFile())
-    {
-        const QString extension = info.suffix().toLower();
-        if (extension == "raw")
-        {
-            const int width = m_cameraUiStates[idx].width.toInt();
-            const int height = m_cameraUiStates[idx].height.toInt();
-            if (width <= 0 || height <= 0)
-            {
-                QMessageBox::critical(this, "Playback Error", "Width and height must be set for raw playback.");
-                return;
-            }
-            m_playbackFile[idx] = new QFile(path, this);
-            if (!m_playbackFile[idx]->open(QIODevice::ReadOnly))
-            {
-                QMessageBox::critical(this, "Playback Error", QString("Unable to open %1").arg(path));
-                delete m_playbackFile[idx];
-                m_playbackFile[idx] = nullptr;
-                return;
-            }
-            m_playbackFrameSize[idx] = qint64(width) * qint64(height);
-            m_playbackRawSequence[idx] = true;
-        }
-        else if (extension == "bmp")
-        {
-            m_playbackFiles[idx].append(path);
-        }
-        else
-        {
-            QMessageBox::critical(this, "Playback Error", "Unsupported playback file format.");
-            return;
-        }
-    }
-    else
-    {
-        QMessageBox::critical(this, "Playback Error", "Playback source is invalid.");
-        return;
-    }
-    m_playbackIndex[idx] = 0;
-    m_playing[idx] = true;
-    if (m_panels[idx]) m_panels[idx]->setPlaying(true);
-    
-    m_playbackTimers[idx]->start();
-    statusBar()->showMessage(QString("[Cam%1] Playback started.").arg(idx), 3000);
-    onPlaybackTimer(idx);
+    m_playbackController->startPlayback(idx, rawPath, width, height, fps);
 }
 
 // ── Global controls ───────────────────────────────────────────────────
@@ -3474,28 +2904,10 @@ void MainWindow::onStartAllClicked()
         return;
     }
 
-    // Step 1: Synchronize UI parameters and countdown timers for both cameras first
     for (int i = 0; i < 2; ++i) {
         if (m_connected[i] && !m_streaming[i]) {
-            if (m_cameraUiStates[i].stopAfterEnabled) {
-                const double duration = m_cameraUiStates[i].saveDuration.toDouble();
-                if (duration > 0.0) {
-                    m_streamEndMs[i] = QDateTime::currentMSecsSinceEpoch() + qint64(duration * 1000.0);
-                    if (m_streamCountdownTimers[i])
-                        m_streamCountdownTimers[i]->start();
-                }
-            } else if (m_streamCountdownTimers[i]) {
-                m_streamCountdownTimers[i]->stop();
-                m_streamEndMs[i] = 0;
-            }
             updateWorkerParams(i);
-        }
-    }
-
-    // Step 2: Immediately trigger startStream on both camera workers concurrently
-    for (int i = 0; i < 2; ++i) {
-        if (m_connected[i] && !m_streaming[i]) {
-            QMetaObject::invokeMethod(m_workers[i], "startStream", Qt::QueuedConnection);
+            if (m_cameraManager) m_cameraManager->startStream(i);
         }
     }
 }
@@ -3509,122 +2921,57 @@ void MainWindow::onSaveAllClicked()
 
     bool anySaving = m_saving[0] || m_saving[1];
     if (anySaving) {
-        // If any camera is currently saving, STOP all saves.
         for (int i = 0; i < 2; ++i) {
             if (m_saving[i]) {
                 stopSave(i, false);
             }
         }
     } else {
-        // If nothing is saving, START saves for any streaming camera.
         for (int i = 0; i < 2; ++i) {
             if (m_streaming[i] && !m_saving[i]) {
                 onSaveClicked(i);
             }
         }
     }
-    
-    // Explicitly sync the global UI state just in case
     syncSidebarButtons(0);
 }
 
 void MainWindow::onMergeSaveClicked()
 {
-    if (m_mergeSaving) {
-        if (m_mergeSaver) {
-            m_mergeSaver->stopSession();
+    if (!m_captureController) return;
+
+    if (!m_captureController->isMergeSaving()) {
+        if (!m_streaming[0] || !m_streaming[1]) {
+            QMessageBox::warning(this, "Merge Save", "Both Camera 0 and Camera 1 must be streaming to start a synced merged save session.");
+            return;
         }
-        m_mergeSaving = false;
-        m_mergedSaveDir.clear();
-
-        for (int i = 0; i < 2; ++i) {
-            if (!m_saving[i] && m_workers[i]) {
-                QMetaObject::invokeMethod(m_workers[i], "setSaving", Qt::QueuedConnection, Q_ARG(bool, false));
-            }
-        }
-
-        syncSidebarButtons(0);
-        syncSidebarButtons(1);
-        statusBar()->showMessage("Merged save session stopped.", 4000);
-        return;
-    }
-
-    if (!m_streaming[0] || !m_streaming[1]) {
-        QMessageBox::warning(this, "Merge Save", "Both Camera 0 and Camera 1 must be streaming to start a synced merged save session.");
-        return;
-    }
-    if (!m_lastFrames[0] || !m_lastFrames[1]) {
-        QMessageBox::information(this, "Merge Save", "Wait until both cameras have delivered a frame before starting merged save.");
-        return;
-    }
-
-    QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString saveDir = m_cameraUiStates[0].savePath + QString("/Merged_%1").arg(ts);
-
-    MergeSaveOptions opts;
-    opts.poolBufferCount = 16;
-    opts.saveFormat = m_cameraUiStates[0].saveFormat;
-    opts.useSingleFile = (opts.saveFormat == ".raw");
-    // Use actual streaming frame dimensions; the UI geometry can differ from
-    // the payload dimensions reported by the cameras (including metadata rows).
-    opts.expectedWidth0 = m_lastFrames[0]->width;
-    opts.expectedHeight0 = (!m_lastFrames[0]->rawData.empty() && m_lastFrames[0]->height > 1)
-        ? m_lastFrames[0]->height - 1 : m_lastFrames[0]->height;
-    opts.expectedWidth1 = m_lastFrames[1]->width;
-    opts.expectedHeight1 = (!m_lastFrames[1]->rawData.empty() && m_lastFrames[1]->height > 1)
-        ? m_lastFrames[1]->height - 1 : m_lastFrames[1]->height;
-    opts.fps = m_cameraUiStates[0].fps.toDouble();
-    if (opts.fps <= 0) opts.fps = 10.0;
-
-    // Enable raw data buffer acquisition in both camera workers
-    for (int i = 0; i < 2; ++i) {
-        if (m_workers[i]) {
-            QMetaObject::invokeMethod(m_workers[i], "setSaving", Qt::QueuedConnection, Q_ARG(bool, true));
-        }
-    }
-
-    if (!m_mergeSaver || !m_mergeSaver->startSession(saveDir, opts)) {
-        QMessageBox::critical(this, "Merge Save Error", QString("Failed to start merge save session in %1").arg(saveDir));
-        return;
-    }
-
-    m_mergedSaveDir = saveDir;
-    m_mergeSaving = true;
-
-    if (m_logTerminal) {
-        // Initialize session.log (playback log)
-        QFile logFile(m_mergedSaveDir + "/session.log");
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream out(&logFile);
-            out << m_logTerminal->toPlainText();
-            if (!m_logTerminal->toPlainText().endsWith("\n") && !m_logTerminal->toPlainText().isEmpty()) {
-                out << "\n";
-            }
-            logFile.close();
+        if (!m_lastFrames[0] || !m_lastFrames[1]) {
+            QMessageBox::information(this, "Merge Save", "Wait until both cameras have delivered a frame before starting merged save.");
+            return;
         }
 
-        // Initialize terminal.log
-        QFile termFile(m_mergedSaveDir + "/terminal.log");
-        if (termFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream out(&termFile);
-            out << m_logTerminal->toPlainText();
-            if (!m_logTerminal->toPlainText().endsWith("\n") && !m_logTerminal->toPlainText().isEmpty()) {
-                out << "\n";
-            }
-            termFile.close();
+        QString baseDir = m_cameraUiStates[0].savePath.trimmed().isEmpty() ? "Capture" : m_cameraUiStates[0].savePath.trimmed();
+        QString timeStr = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+        QString sessionDir = QString("%1/Merged_%2").arg(baseDir).arg(timeStr);
+
+        MergeSaveOptions opts;
+        opts.saveFormat = m_cameraUiStates[0].saveFormat;
+        opts.useSingleFile = (opts.saveFormat == ".raw");
+        opts.expectedWidth0 = m_lastFrames[0]->width;
+        opts.expectedHeight0 = (!m_lastFrames[0]->rawData.empty() && m_lastFrames[0]->height > 1)
+            ? m_lastFrames[0]->height - 1 : m_lastFrames[0]->height;
+        opts.expectedWidth1 = m_lastFrames[1]->width;
+        opts.expectedHeight1 = (!m_lastFrames[1]->rawData.empty() && m_lastFrames[1]->height > 1)
+            ? m_lastFrames[1]->height - 1 : m_lastFrames[1]->height;
+        opts.fps = m_cameraUiStates[0].fps.toDouble();
+        if (opts.fps <= 0) opts.fps = 10.0;
+
+        if (!m_captureController->startMergeSave(sessionDir, opts)) {
+            QMessageBox::critical(this, "Merge Save Error", QString("Failed to start merge save session in %1").arg(sessionDir));
         }
+    } else {
+        m_captureController->stopMergeSave();
     }
-    for (int i = 0; i < 2; ++i) {
-        const QString sensorVal = m_lastSensorTemp[i] > -999.0f
-            ? QString::number(m_lastSensorTemp[i], 'f', 1) : "—";
-        const QString grabberVal = m_lastGrabberTemp[i] > -999.0f
-            ? QString::number(m_lastGrabberTemp[i], 'f', 1) : "—";
-        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(i).arg(sensorVal));
-        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(i).arg(grabberVal));
-    }
-    syncSidebarButtons(0);
-    syncSidebarButtons(1);
-    statusBar()->showMessage("Merged save started.", 3000);
 }
 
 void MainWindow::onMergeSaverStats(quint64, quint64, quint64)
@@ -3643,146 +2990,29 @@ void MainWindow::onToggleControlsClicked()
 void MainWindow::onFrameReady(FramePacketPtr pkt)
 {
     if (!pkt) return;
-    int idx = pkt->cameraIndex; if(idx<0||idx>1) return;
+    int idx = pkt->cameraIndex;
+    if (idx < 0 || idx > 1) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
 
     const int syncMode = m_calibModeCombo ? m_calibModeCombo->currentIndex() : 0;
-    const bool syncOffsetActive = (syncMode == 1)
-        ? (m_timeDelaySpin && m_timeDelaySpin->value() != 0.0)
-        : (getLineDelayValue() != 0);
-    const bool mustProcessEveryFrame = m_saving[idx] || m_mergeSaving || m_calibrationMode || syncOffsetActive;
+    const double timeDelaySec = m_timeDelaySpin ? m_timeDelaySpin->value() : 0.0;
+    const double fps = m_cameraUiStates[0].fps.toDouble();
+
+    const bool mustProcessEveryFrame = (m_captureController && (m_captureController->isSaving(idx) || m_captureController->isMergeSaving()))
+                                    || (m_calibrationEngine && m_calibrationEngine->isCalibrating());
     if (!mustProcessEveryFrame && pkt->timestampMs > 0 && now - pkt->timestampMs > 100)
         return;
-    
-    const int H_total = pkt->height;
-    const int H_img = (!pkt->rawData.empty() && H_total > 1) ? (H_total - 1) : H_total;
-    m_totalLinesReceived[idx] += H_img;
-    
-    if (m_calibrationMode && m_calibModeCombo && m_calibModeCombo->currentIndex() == 2) { // Auto-Detect
-        int W = pkt->width;
-        int H = H_img;
-        const auto pixels = CameraWorker::displayPixelsWithoutMetadata(*pkt);
-        if (W > 0 && H > 0 && pixels.size() >= static_cast<size_t>(W * H)) {
-            int activeStart = H > 500 ? 100 : 0;
-            int activeEnd = H > 500 ? H - 100 : H;
-            
-            // Sub-sample the frame to calculate average brightness extremely fast (prevents UI freeze)
-            double frameSum = 0;
-            size_t count = 0;
-            size_t startIdx = static_cast<size_t>(activeStart * W);
-            size_t endIdx = static_cast<size_t>(activeEnd * W);
-            for (size_t i = startIdx; i < endIdx; i += 256) {
-                frameSum += pixels[i];
-                count++;
-            }
-            double avgFrameVal = count > 0 ? frameSum / count : 0.0;
-            
-            bool isWhiteScreen = (avgFrameVal > 128);
-            int detectedRow = -1;
-            bool detected = false;
-            
-            if (isWhiteScreen) {
-                // Screen is white, line is black: find row with MINIMUM average
-                double minRowAvg = 255.0;
-                int minRow = activeStart;
-                for (int y = activeStart; y < activeEnd; ++y) {
-                    long sum = 0;
-                    int countX = 0;
-                    const uint8_t* row = &pixels[y * W];
-                    for (int x = 0; x < W; x += 32) {
-                        sum += row[x];
-                        countX++;
-                    }
-                    double rowAvg = countX > 0 ? (double)sum / countX : 255.0;
-                    if (rowAvg < minRowAvg) {
-                        minRowAvg = rowAvg;
-                        minRow = y;
-                    }
-                }
-                
-                // Threshold check: average of the row is significantly darker than the white background
-                if (minRowAvg < avgFrameVal - 30) {
-                    detectedRow = minRow;
-                    detected = true;
-                }
-            } else {
-                // Screen is black, line is white: find row with MAXIMUM average
-                double maxRowAvg = 0.0;
-                int maxRow = activeStart;
-                for (int y = activeStart; y < activeEnd; ++y) {
-                    long sum = 0;
-                    int countX = 0;
-                    const uint8_t* row = &pixels[y * W];
-                    for (int x = 0; x < W; x += 32) {
-                        sum += row[x];
-                        countX++;
-                    }
-                    double rowAvg = countX > 0 ? (double)sum / countX : 0.0;
-                    if (rowAvg > maxRowAvg) {
-                        maxRowAvg = rowAvg;
-                        maxRow = y;
-                    }
-                }
-                
-                // Threshold check: average of the row is significantly brighter than the black background
-                if (maxRowAvg > avgFrameVal + 30) {
-                    detectedRow = maxRow;
-                    detected = true;
-                }
-            }
-            
-            if (detected) {
-                if (idx == 0 && !m_autoCam1Detected) {
-                    m_cam1MarkLines = m_totalLinesReceived[0] - H + detectedRow;
-                    m_autoCam1Detected = true;
-                    QMetaObject::invokeMethod(this, [this]{ 
-                        m_startCalibrationBtn->setText(" Waiting for CAM2... "); 
-                    });
-                }
-                if (idx == 1 && m_autoCam1Detected && !m_autoCam2Detected) {
-                    m_cam2MarkLines = m_totalLinesReceived[1]; // record current CAM1 time
-                    m_autoCam2Detected = true;
-                    QMetaObject::invokeMethod(this, [this]{ 
-                        qint64 diff = m_cam2MarkLines - m_cam1MarkLines;
-                        setLineDelayValue(diff);
-                        if (m_calibModeCombo) m_calibModeCombo->setCurrentIndex(0);
-                    });
-                }
-            }
-        }
-    }
-    
-    int delayLines = 0;
-    int mode = m_calibModeCombo ? m_calibModeCombo->currentIndex() : 0;
-    if (mode == 1) {
-        double fps = m_cameraUiStates[0].fps.toDouble();
-        if (fps <= 0) fps = 1.0;
-        double t = m_timeDelaySpin ? m_timeDelaySpin->value() : 0.0;
-        delayLines = static_cast<int>(t * fps * H_img);
-    } else {
-        delayLines = getLineDelayValue();
+
+    if (m_calibrationEngine) {
+        pkt = m_calibrationEngine->processFrame(pkt, syncMode, timeDelaySec, fps);
     }
 
-    bool appliedLineDelay = false;
-    if (idx == 0) {
-        m_cam1DelayBuffer.delayLines = std::max(0, delayLines);
-        appliedLineDelay = (m_cam1DelayBuffer.delayLines > 0);
-        pkt = m_cam1DelayBuffer.process(pkt);
-    } else if (idx == 1) {
-        m_cam2DelayBuffer.delayLines = std::max(0, -delayLines);
-        appliedLineDelay = (m_cam2DelayBuffer.delayLines > 0);
-        pkt = m_cam2DelayBuffer.process(pkt);
-    }
-    if (appliedLineDelay)
-        pkt->timestampMs = now;
+    m_lastFrames[idx] = pkt;
+    m_frameCount[idx]++;
 
-    m_lastFrames[idx] = pkt; m_frameCount[idx]++;
-
-    if (m_mergeSaving && m_mergeSaver && m_mergeSaver->isSaving()) {
-        if (m_lastFrames[0] && m_lastFrames[1]) {
-            if (idx == 1) {
-                m_mergeSaver->pushSyncedPair(m_lastFrames[0], m_lastFrames[1]);
-            }
+    if (m_captureController && m_captureController->isMergeSaving()) {
+        if (m_lastFrames[0] && m_lastFrames[1] && idx == 1) {
+            m_captureController->pushMergedPair(m_lastFrames[0], m_lastFrames[1]);
         }
     }
 
@@ -3790,141 +3020,15 @@ void MainWindow::onFrameReady(FramePacketPtr pkt)
     int limitMs = std::max(1, (int)(1000.0 / cameraFps) - 2);
     const bool displayFrameFresh = (pkt->timestampMs <= 0 || now - pkt->timestampMs <= 100);
     const bool updateDisplay = displayFrameFresh && (m_lastDisplayMs[idx] == 0 || now - m_lastDisplayMs[idx] >= limitMs);
-    if (updateDisplay)
-    {
+    if (updateDisplay) {
         m_lastDisplayMs[idx] = now;
         refreshDisplay(idx);
-        if (m_viewFpsLabels[idx]) m_viewFpsLabels[idx]->setText(m_panels[idx]->fpsLabel->text());
-        if (m_viewStatusLabels[idx]) m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
+        if (m_viewFpsLabels[idx] && m_panels[idx]) m_viewFpsLabels[idx]->setText(m_panels[idx]->fpsLabel->text());
+        if (m_viewStatusLabels[idx] && m_panels[idx]) m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
     }
 
-    if (m_saving[idx])
-    {
-        const QString saveMode = m_cameraUiStates[idx].saveMode;
-        const QString saveFormat = m_cameraUiStates[idx].saveFormat;
-        bool writeSuccess = true;
-        QString errorMsg;
-        auto recordSavedFrame = [this, idx, &pkt]() {
-            if (m_saveFrameCount[idx] == 0) {
-                m_firstSavedFrameMs[idx] = pkt->timestampMs;
-                m_savedFrameWidth[idx] = pkt->width;
-                m_savedFrameHeight[idx] = (!pkt->rawData.empty() && pkt->height > 1)
-                    ? pkt->height - 1
-                    : pkt->height;
-            }
-            m_lastSavedFrameMs[idx] = pkt->timestampMs;
-            ++m_saveFrameCount[idx];
-        };
-
-        try {
-            if (saveFormat == ".bmp")
-            {
-                const auto pixels = CameraWorker::displayPixelsWithoutMetadata(*pkt);
-                if (pixels.empty()) return;
-                const int displayHeight = (pkt->rawData.empty() || pkt->height <= 1) ? pkt->height : (pkt->height - 1);
-                const QString fileName = QString("%1/frame_%2.bmp")
-                    .arg(m_saveDirs[idx])
-                    .arg(m_saveFrameCount[idx] + 1, 5, 10, QChar('0'));
-
-                QImage img(pixels.data(), pkt->width, displayHeight, pkt->width, QImage::Format_Grayscale8);
-                writeSuccess = img.save(fileName, "BMP");
-                if (!writeSuccess) {
-                    errorMsg = QString("Failed to save BMP frame: %1").arg(fileName);
-                } else {
-                    recordSavedFrame();
-                }
-            }
-            else
-            {
-                if (pkt->rawData.empty())
-                {
-                    if (m_emptyRawFrameSkips[idx]++ == 0)
-                        appendLogLine(QString("[Cam%1] Skipping queued frame without raw camera bytes at save start.").arg(idx));
-                    return;
-                }
-
-                const size_t rawBytesToWrite = CameraWorker::rawBytesWithoutMetadata(*pkt);
-                if (rawBytesToWrite == 0)
-                {
-                    if (m_emptyRawFrameSkips[idx]++ == 0)
-                        appendLogLine(QString("[Cam%1] Skipping raw frame because metadata stripping produced no image bytes.").arg(idx));
-                    return;
-                }
-
-                if (saveMode == "Single File")
-                {
-                    if (m_saveFiles[idx])
-                    {
-                        size_t written = fwrite(pkt->rawData.data(), 1, rawBytesToWrite, m_saveFiles[idx]);
-                        if (written != rawBytesToWrite)
-                        {
-                            writeSuccess = false;
-                            errorMsg = "fwrite returned incomplete write count (disk full?)";
-                        }
-                    }
-                    else
-                    {
-                        writeSuccess = false;
-                        errorMsg = "Single File handle was null";
-                    }
-                    if (writeSuccess)
-                        recordSavedFrame();
-                }
-                else
-                {
-                    const QString fileName = QString("%1/frame_%2.raw")
-                        .arg(m_saveDirs[idx])
-                        .arg(m_saveFrameCount[idx] + 1, 5, 10, QChar('0'));
-                    QFile f(fileName);
-                    if (f.open(QIODevice::WriteOnly))
-                    {
-                        qint64 written = f.write(reinterpret_cast<const char*>(pkt->rawData.data()), rawBytesToWrite);
-                        f.close();
-                        if (written != (qint64)rawBytesToWrite)
-                        {
-                            writeSuccess = false;
-                            errorMsg = "QFile::write failed to write complete frame data (disk full?)";
-                        }
-                    }
-                    else
-                    {
-                        writeSuccess = false;
-                        errorMsg = QString("Failed to open file for write: %1").arg(fileName);
-                    }
-                    if (writeSuccess)
-                        recordSavedFrame();
-                }
-            }
-        }
-        catch (const std::exception& e)
-        {
-            writeSuccess = false;
-            errorMsg = QString("Exception writing frame file: %1").arg(e.what());
-        }
-        catch (...)
-        {
-            writeSuccess = false;
-            errorMsg = "Unknown exception writing frame file";
-        }
-
-        if (!writeSuccess)
-        {
-            appendLogLine(QString("[Cam%1] Save stopped").arg(idx));
-            m_saving[idx] = false;
-            if (m_workers[idx])
-                QMetaObject::invokeMethod(m_workers[idx], "setSaving",
-                                          Qt::QueuedConnection, Q_ARG(bool, false));
-            
-            if (m_saveFiles[idx])
-            {
-                fclose(m_saveFiles[idx]);
-                m_saveFiles[idx] = nullptr;
-            }
-
-            m_panels[idx]->setSaving(false);
-            appendLogLine(QString("[Cam%1] Save stopped due to write failure: %2").arg(idx).arg(errorMsg));
-            statusBar()->showMessage(QString("[Cam%1] Save stopped: write failed.").arg(idx), 5000);
-        }
+    if (m_captureController && m_captureController->isSaving(idx)) {
+        m_captureController->writeFrame(idx, pkt);
     }
 }
 
@@ -3946,7 +3050,7 @@ void MainWindow::onLogMessage(const QString& m)
             const QString ts = QDateTime::currentDateTime().toString("HH:mm:ss");
             m_logTerminal->appendPlainText(QString("[%1] %2").arg(ts, m));
         }
-        appendCaptureTelemetry(m);
+        if (m_captureController) m_captureController->appendTelemetry(m);
         return;
     }
 
@@ -4067,10 +3171,8 @@ void MainWindow::onCameraOpened(int i, int actualWidth, int actualHeight)
 
 void MainWindow::onCameraClosed(int i)
 {
-    m_connected[i]=m_streaming[i]=m_saving[i]=false;
-    if (m_saveFiles[i]){fclose(m_saveFiles[i]);m_saveFiles[i]=nullptr;}
-    if (m_streamCountdownTimers[i]) m_streamCountdownTimers[i]->stop();
-    m_saveFrameCount[i] = 0;
+    m_connected[i] = m_streaming[i] = m_saving[i] = false;
+    if (m_captureController) m_captureController->stopSave(i);
     m_panels[i]->setConnected(false); m_panels[i]->setStreaming(false); m_panels[i]->setSaving(false); m_panels[i]->clearFrame();
     syncSidebarButtons(i);
     m_viewLabels[i]->clear(); m_viewLabels[i]->setText("No Signal");
@@ -4106,11 +3208,13 @@ void MainWindow::onTemperatureReady(int idx, float sensor, float grabber)
     if (m_viewSensorTempLabels[idx])  m_viewSensorTempLabels[idx]->setText(sensorText);
     if (m_viewGrabberTempLabels[idx]) m_viewGrabberTempLabels[idx]->setText(grabberText);
 
-    if (m_saving[idx] || m_mergeSaving) {
+    if (m_saving[idx] || isMergeSaving()) {
         const QString sensorVal = (sensor > -999.0f) ? QString("%1").arg(sensor, 0, 'f', 1) : "—";
         const QString grabberVal = (grabber > -999.0f) ? QString("%1").arg(grabber, 0, 'f', 1) : "—";
-        appendCaptureTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
-        appendCaptureTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
+        if (m_captureController) {
+            m_captureController->appendTelemetry(QString("[Cam%1] Sensor Temp: %2").arg(idx).arg(sensorVal));
+            m_captureController->appendTelemetry(QString("[Cam%1] Grabber Temp: %2").arg(idx).arg(grabberVal));
+        }
     }
 }
 
@@ -4199,1629 +3303,201 @@ void MainWindow::closeEvent(QCloseEvent* e)
 
 QString MainWindow::getPreferencesFilePath() const
 {
-    QString currentDir = QDir::currentPath();
-    QString iniInCwd = currentDir + "/ui_preferences.ini";
-    if (QFileInfo::exists(iniInCwd) && QFileInfo(iniInCwd).isWritable()) {
-        return iniInCwd;
-    }
-
-    QString appDir = QCoreApplication::applicationDirPath();
-    QString iniInApp = appDir + "/ui_preferences.ini";
-    if (QFileInfo::exists(iniInApp) && QFileInfo(iniInApp).isWritable()) {
-        return iniInApp;
-    }
-
-    QFileInfo cwdInfo(currentDir);
-    if (cwdInfo.isWritable()) {
-        return iniInCwd;
-    }
-    return iniInApp;
+    return SettingsManager::getPreferencesFilePath();
 }
 
 void MainWindow::saveSettings()
 {
-    const QString prefPath = getPreferencesFilePath();
-    QSettings settings(prefPath, QSettings::IniFormat);
+    GeneralAppSettings general;
+    general.darkMode = m_darkMode;
+    general.currentPreset = static_cast<int>(m_currentPreset);
+    general.geometry = saveGeometry();
+    general.windowState = saveState();
+    general.displayStretch = m_displayModeBtn ? m_displayModeBtn->isChecked() : false;
+    general.pixelStretch = m_pixelStretchCheck ? m_pixelStretchCheck->isChecked() : false;
+    general.saveModeMerged = m_saveModeToggleBtn ? m_saveModeToggleBtn->isChecked() : false;
+    general.lineDelay = getLineDelayValue();
+    general.timeDelay = m_timeDelaySpin ? m_timeDelaySpin->value() : 0.0;
+    general.calibMode = m_calibModeCombo ? m_calibModeCombo->currentIndex() : 0;
 
-    settings.beginGroup("General");
-    settings.setValue("darkMode", m_darkMode);
-    settings.setValue("currentPreset", static_cast<int>(m_currentPreset));
-    settings.setValue("geometry", saveGeometry());
-    settings.setValue("windowState", saveState());
-    settings.setValue("displayStretch", m_displayModeBtn ? m_displayModeBtn->isChecked() : false);
-    settings.setValue("pixelStretch", m_pixelStretchCheck ? m_pixelStretchCheck->isChecked() : false);
-    settings.setValue("saveModeMerged", m_saveModeToggleBtn ? m_saveModeToggleBtn->isChecked() : false);
-    settings.setValue("lineDelay", getLineDelayValue());
-    if (m_timeDelaySpin) settings.setValue("timeDelay", m_timeDelaySpin->value());
-    if (m_calibModeCombo) settings.setValue("calibMode", m_calibModeCombo->currentIndex());
-    settings.endGroup();
+    std::vector<QString> regionModes[2];
+    std::vector<QString> regionOffsets[2];
+    std::vector<int> regionBinnings[2];
 
-    for (int i = 0; i < 2; ++i)
-    {
-        settings.beginGroup(QString("Camera%1").arg(i));
-        const CameraUiState& state = m_cameraUiStates[i];
-        settings.setValue("width", state.width);
-        settings.setValue("height", state.height);
-        settings.setValue("fps", state.fps);
-        settings.setValue("exposure", state.exposure);
-        settings.setValue("gain", state.gain);
-        settings.setValue("testPattern", state.testPattern);
-        settings.setValue("tdiMode", state.tdiMode);
-        settings.setValue("tdiStages", state.tdiStages);
-        settings.setValue("tdiYShift", state.tdiYShift);
-        settings.setValue("tdiFrameCount", state.tdiFrameCount);
-        settings.setValue("reverseX", state.reverseX);
-        settings.setValue("reverseY", state.reverseY);
-        settings.setValue("savePath", state.savePath);
-        settings.setValue("rawPath", state.rawPath);
-        settings.setValue("saveFormat", state.saveFormat);
-        settings.setValue("saveMode", state.saveMode);
-        settings.setValue("stopAfterEnabled", state.stopAfterEnabled);
-        settings.setValue("saveDuration", state.saveDuration);
-
-        if (m_panels[i])
-        {
-            for (int r = 0; r < 7; ++r)
-            {
+    for (int i = 0; i < 2; ++i) {
+        regionModes[i].resize(7);
+        regionOffsets[i].resize(7);
+        regionBinnings[i].resize(7, 0);
+        if (m_panels[i]) {
+            for (int r = 0; r < 7; ++r) {
                 if (m_panels[i]->regionModeCombos[r])
-                    settings.setValue(QString("region%1_mode").arg(r), m_panels[i]->regionModeCombos[r]->currentText());
+                    regionModes[i][r] = m_panels[i]->regionModeCombos[r]->currentText();
                 if (m_panels[i]->regionOffsetEdits[r])
-                    settings.setValue(QString("region%1_offset").arg(r), m_panels[i]->regionOffsetEdits[r]->text());
+                    regionOffsets[i][r] = m_panels[i]->regionOffsetEdits[r]->text();
                 if (m_panels[i]->regionBinningCombos[r])
-                    settings.setValue(QString("region%1_binning").arg(r), m_panels[i]->regionBinningCombos[r]->currentIndex());
+                    regionBinnings[i][r] = m_panels[i]->regionBinningCombos[r]->currentIndex();
             }
         }
-        settings.endGroup();
     }
 
-    settings.sync();
-
-    // Mirror to legacy QSettings for backwards compatibility
-    QSettings legacySettings("KAYA", "SpikeDualDisplay");
-    legacySettings.setValue("darkMode", m_darkMode);
-    legacySettings.setValue("currentPreset", static_cast<int>(m_currentPreset));
-    legacySettings.setValue("geometry", saveGeometry());
-    legacySettings.setValue("windowState", saveState());
-    for (int i = 0; i < 2; ++i) {
-        const CameraUiState& state = m_cameraUiStates[i];
-        legacySettings.setValue(QString("cam%1_width").arg(i), state.width);
-        legacySettings.setValue(QString("cam%1_height").arg(i), state.height);
-        legacySettings.setValue(QString("cam%1_fps").arg(i), state.fps);
-        legacySettings.setValue(QString("cam%1_exposure").arg(i), state.exposure);
-        legacySettings.setValue(QString("cam%1_gain").arg(i), state.gain);
-        legacySettings.setValue(QString("cam%1_testPattern").arg(i), state.testPattern);
-        legacySettings.setValue(QString("cam%1_tdiMode").arg(i), state.tdiMode);
-        legacySettings.setValue(QString("cam%1_tdiStages").arg(i), state.tdiStages);
-        legacySettings.setValue(QString("cam%1_tdiYShift").arg(i), state.tdiYShift);
-        legacySettings.setValue(QString("cam%1_tdiFrameCount").arg(i), state.tdiFrameCount);
-    }
+    SettingsManager::saveSettings(general, m_cameraUiStates, regionModes, regionOffsets, regionBinnings);
 }
 
 void MainWindow::loadSettings()
 {
-    const QString prefPath = getPreferencesFilePath();
-    const bool iniExists = QFileInfo::exists(prefPath);
-    QSettings settings(prefPath, QSettings::IniFormat);
-    QSettings legacySettings("KAYA", "SpikeDualDisplay");
+    GeneralAppSettings general;
+    general.darkMode = m_darkMode;
+    general.currentPreset = static_cast<int>(m_currentPreset);
 
-    auto getValue = [&](const QString& group, const QString& key, const QVariant& defVal, const QString& legacyKey = QString()) -> QVariant {
-        if (settings.contains(group + "/" + key)) {
-            return settings.value(group + "/" + key);
-        }
-        if (!legacyKey.isEmpty() && legacySettings.contains(legacyKey)) {
-            return legacySettings.value(legacyKey);
-        }
-        return defVal;
-    };
-
-    if (settings.contains("General/geometry") || legacySettings.contains("geometry")) {
-        QByteArray geom = getValue("General", "geometry", QByteArray(), "geometry").toByteArray();
-        if (!geom.isEmpty()) restoreGeometry(geom);
-    }
-    if (settings.contains("General/windowState") || legacySettings.contains("windowState")) {
-        QByteArray state = getValue("General", "windowState", QByteArray(), "windowState").toByteArray();
-        if (!state.isEmpty()) restoreState(state);
-    }
-    if (settings.contains("General/darkMode") || legacySettings.contains("darkMode")) {
-        m_darkMode = getValue("General", "darkMode", false, "darkMode").toBool();
-        if (m_darkModeBtn) {
-            m_darkModeBtn->setChecked(m_darkMode);
-        }
-    }
-    if (settings.contains("General/displayStretch")) {
-        bool stretch = settings.value("General/displayStretch", false).toBool();
-        if (m_displayModeBtn) {
-            m_displayModeBtn->setChecked(stretch);
-            onDisplayModeToggled();
-        }
-    }
-    if (settings.contains("General/pixelStretch")) {
-        bool ps = settings.value("General/pixelStretch", false).toBool();
-        if (m_pixelStretchCheck) {
-            m_pixelStretchCheck->setChecked(ps);
-            onPixelStretchToggled(ps);
-        }
-    }
-    if (settings.contains("General/saveModeMerged")) {
-        bool merged = settings.value("General/saveModeMerged", false).toBool();
-        if (m_saveModeToggleBtn) {
-            m_saveModeToggleBtn->setChecked(merged);
-        }
-    }
-    if (settings.contains("General/currentPreset") || legacySettings.contains("currentPreset")) {
-        int preset = getValue("General", "currentPreset", 0, "currentPreset").toInt();
-        switch(preset) {
-            case static_cast<int>(PresetLayout::SideBySide): applyPresetSideBySide(); break;
-            case static_cast<int>(PresetLayout::TopBottom): applyPresetTopBottom(); break;
-            case static_cast<int>(PresetLayout::DualControl): applyPresetDualControl(); break;
-            case static_cast<int>(PresetLayout::ControlsTop): applyPresetControlsTop(); break;
-            default: applyPresetSideBySide(); break;
-        }
-    } else {
-        applyPresetSideBySide();
+    std::vector<QString> regionModes[2];
+    std::vector<QString> regionOffsets[2];
+    std::vector<int> regionBinnings[2];
+    for (int i = 0; i < 2; ++i) {
+        regionModes[i].resize(7);
+        regionOffsets[i].resize(7);
+        regionBinnings[i].resize(7, 0);
     }
 
+    SettingsManager::loadSettings(general, m_cameraUiStates, regionModes, regionOffsets, regionBinnings);
+
+    m_darkMode = general.darkMode;
+    if (m_darkModeBtn) {
+        m_darkModeBtn->blockSignals(true);
+        m_darkModeBtn->setChecked(m_darkMode);
+        m_darkModeBtn->blockSignals(false);
+    }
+
+    if (!general.geometry.isEmpty()) restoreGeometry(general.geometry);
+    if (!general.windowState.isEmpty()) restoreState(general.windowState);
+
+    m_currentPreset = static_cast<PresetLayout>(general.currentPreset);
     if (m_layoutCombo) {
-        int idx = m_layoutCombo->findData(static_cast<int>(m_currentPreset));
-        if (idx >= 0) {
-            m_layoutCombo->blockSignals(true);
-            m_layoutCombo->setCurrentIndex(idx);
-            m_layoutCombo->blockSignals(false);
-        }
+        m_layoutCombo->blockSignals(true);
+        m_layoutCombo->setCurrentIndex(general.currentPreset);
+        m_layoutCombo->blockSignals(false);
     }
 
-    static const int defOffsets[7] = {0, 900, 2000, 3000, 4000, 5000, 6000};
-    for (int i = 0; i < 2; ++i)
-    {
-        const QString grp = QString("Camera%1").arg(i);
-        CameraUiState& state = m_cameraUiStates[i];
+    switch (m_currentPreset) {
+        case PresetLayout::TopBottom: applyPresetTopBottom(); break;
+        case PresetLayout::DualControl: applyPresetDualControl(); break;
+        case PresetLayout::ControlsTop: applyPresetControlsTop(); break;
+        default: applyPresetSideBySide(); break;
+    }
 
-        state.width = getValue(grp, "width", state.width, QString("cam%1_width").arg(i)).toString();
-        state.height = getValue(grp, "height", state.height, QString("cam%1_height").arg(i)).toString();
-        state.fps = getValue(grp, "fps", state.fps, QString("cam%1_fps").arg(i)).toString();
-        state.exposure = getValue(grp, "exposure", state.exposure, QString("cam%1_exposure").arg(i)).toString();
-        state.gain = getValue(grp, "gain", state.gain, QString("cam%1_gain").arg(i)).toString();
-        state.testPattern = getValue(grp, "testPattern", "Off", QString("cam%1_testPattern").arg(i)).toString();
-        if (state.testPattern != "Gray Diagonal Ramp" && state.testPattern != "Off") state.testPattern = "Off";
+    if (m_displayModeBtn) {
+        m_displayModeBtn->blockSignals(true);
+        m_displayModeBtn->setChecked(general.displayStretch);
+        m_displayModeBtn->blockSignals(false);
+        m_fitToScreen = general.displayStretch;
+        setProperty("fitToScreen", m_fitToScreen);
+    }
 
-        state.tdiMode = getValue(grp, "tdiMode", state.tdiMode, QString("cam%1_tdiMode").arg(i)).toString();
-        state.tdiStages = getValue(grp, "tdiStages", state.tdiStages, QString("cam%1_tdiStages").arg(i)).toString();
-        if (state.tdiStages.toInt() <= 0) state.tdiStages = "4";
-        state.tdiYShift = getValue(grp, "tdiYShift", state.tdiYShift, QString("cam%1_tdiYShift").arg(i)).toString();
-        if (state.tdiYShift.toInt() < 0) state.tdiYShift = "16";
-        state.tdiFrameCount = getValue(grp, "tdiFrameCount", state.tdiFrameCount, QString("cam%1_tdiFrameCount").arg(i)).toString();
-        if (state.tdiFrameCount.toInt() <= 0) state.tdiFrameCount = "10";
+    if (m_pixelStretchCheck) {
+        m_pixelStretchCheck->blockSignals(true);
+        m_pixelStretchCheck->setChecked(general.pixelStretch);
+        m_pixelStretchCheck->blockSignals(false);
+        m_pixelStretch = general.pixelStretch;
+        setProperty("pixelStretch", m_pixelStretch);
+    }
 
-        state.reverseX = getValue(grp, "reverseX", state.reverseX, QString("cam%1_reverseX").arg(i)).toBool();
-        state.reverseY = getValue(grp, "reverseY", state.reverseY, QString("cam%1_reverseY").arg(i)).toBool();
-        state.savePath = getValue(grp, "savePath", state.savePath, QString("cam%1_savePath").arg(i)).toString();
-        state.rawPath = getValue(grp, "rawPath", state.rawPath, QString("cam%1_rawPath").arg(i)).toString();
-        state.saveFormat = getValue(grp, "saveFormat", state.saveFormat, QString("cam%1_saveFormat").arg(i)).toString();
-        state.saveMode = getValue(grp, "saveMode", state.saveMode, QString("cam%1_saveMode").arg(i)).toString();
-        state.stopAfterEnabled = getValue(grp, "stopAfterEnabled", state.stopAfterEnabled, QString("cam%1_stopAfterEnabled").arg(i)).toBool();
-        state.saveDuration = getValue(grp, "saveDuration", state.saveDuration, QString("cam%1_saveDuration").arg(i)).toString();
+    if (m_saveModeToggleBtn) {
+        m_saveModeToggleBtn->blockSignals(true);
+        m_saveModeToggleBtn->setChecked(general.saveModeMerged);
+        m_saveModeToggleBtn->blockSignals(false);
+    }
 
-        if (m_panels[i])
-        {
-            for (int r = 0; r < 7; ++r)
-            {
-                QString defMode = (r == 0) ? "On" : "Off";
-                QString mode = getValue(grp, QString("region%1_mode").arg(r), defMode, QString("cam%1_region%2_mode").arg(i).arg(r)).toString();
-                if (mode != "On" && mode != "Off") mode = defMode;
-                if (m_panels[i]->regionModeCombos[r])
-                    m_panels[i]->regionModeCombos[r]->setCurrentText(mode);
+    setLineDelayValue(general.lineDelay);
+    if (m_timeDelaySpin) m_timeDelaySpin->setValue(general.timeDelay);
+    if (m_calibModeCombo) m_calibModeCombo->setCurrentIndex(general.calibMode);
 
-                QString defVal = QString::number(defOffsets[r]);
-                QString val = getValue(grp, QString("region%1_offset").arg(r), defVal, QString("cam%1_region%2_offset").arg(i).arg(r)).toString().trimmed();
-                if (val.isEmpty() || val == "-1" || val.toInt() < 0) val = defVal;
-                if (m_panels[i]->regionOffsetEdits[r])
-                    m_panels[i]->regionOffsetEdits[r]->setText(val);
-
-                int binIdx = getValue(grp, QString("region%1_binning").arg(r), 0, QString("cam%1_region%2_binning").arg(i).arg(r)).toInt();
-                if (m_panels[i]->regionBinningCombos[r]) {
-                    if (binIdx >= 0 && binIdx < m_panels[i]->regionBinningCombos[r]->count())
-                        m_panels[i]->regionBinningCombos[r]->setCurrentIndex(binIdx);
-                }
-            }
-            m_panels[i]->syncBinningControlsWithRegionModes();
-        }
-
-        state.appliedWidth = state.width;
-        state.appliedHeight = state.height;
-
+    for (int i = 0; i < 2; ++i) {
         applyCameraUiStateToWidgets(i);
-        updateWorkerParams(i);
-    }
-
-    if (settings.contains("General/lineDelay") || legacySettings.contains("lineDelay")) {
-        setLineDelayValue(getValue("General", "lineDelay", 0, "lineDelay").toInt());
-    }
-    if (m_timeDelaySpin && (settings.contains("General/timeDelay") || legacySettings.contains("timeDelay"))) {
-        m_timeDelaySpin->setValue(getValue("General", "timeDelay", 0.0, "timeDelay").toDouble());
-    }
-    if (m_calibModeCombo && (settings.contains("General/calibMode") || legacySettings.contains("calibMode"))) {
-        m_calibModeCombo->setCurrentIndex(getValue("General", "calibMode", 0, "calibMode").toInt());
-    }
-
-    if (!iniExists) {
-        saveSettings();
+        if (m_panels[i]) {
+            for (int r = 0; r < 7; ++r) {
+                if (m_panels[i]->regionModeCombos[r] && !regionModes[i][r].isEmpty())
+                    m_panels[i]->regionModeCombos[r]->setCurrentText(regionModes[i][r]);
+                if (m_panels[i]->regionOffsetEdits[r] && !regionOffsets[i][r].isEmpty())
+                    m_panels[i]->regionOffsetEdits[r]->setText(regionOffsets[i][r]);
+                if (m_panels[i]->regionBinningCombos[r])
+                    m_panels[i]->regionBinningCombos[r]->setCurrentIndex(regionBinnings[i][r]);
+            }
+        }
     }
 }
 
 void MainWindow::resetAllValuesToDefault()
 {
-    const QString prefPath = getPreferencesFilePath();
-    if (QFileInfo::exists(prefPath)) {
-        QFile::remove(prefPath);
+    GeneralAppSettings general;
+    std::vector<QString> regionModes[2];
+    std::vector<QString> regionOffsets[2];
+    std::vector<int> regionBinnings[2];
+    for (int i = 0; i < 2; ++i) {
+        regionModes[i].resize(7);
+        regionOffsets[i].resize(7);
+        regionBinnings[i].resize(7, 0);
     }
-    QSettings legacySettings("KAYA", "SpikeDualDisplay");
-    legacySettings.clear();
-    
-    m_darkMode = false;
-    if (m_darkModeBtn) m_darkModeBtn->setChecked(false);
-    applyStyles();
-    
-    if (m_displayModeBtn) {
-        m_displayModeBtn->setChecked(false);
-        onDisplayModeToggled();
+
+    SettingsManager::resetAllValuesToDefault(general, m_cameraUiStates, regionModes, regionOffsets, regionBinnings);
+
+    m_darkMode = general.darkMode;
+    if (m_darkModeBtn) {
+        m_darkModeBtn->setChecked(m_darkMode);
     }
-    
-    if (m_layoutCombo) m_layoutCombo->setCurrentIndex(0);
+
     applyPresetSideBySide();
 
-    static const int defOffsets[7] = {0, 900, 2000, 3000, 4000, 5000, 6000};
-    // Reset camera UI states to defaults
-    for (int i = 0; i < 2; ++i) {
-        CameraUiState& state = m_cameraUiStates[i];
-        state.width = "9344";
-        state.height = "3840";
-        state.fps = "1.0";
-        state.exposure = "29999";
-        state.gain = "1.0";
-        state.testPattern = "Off";
-        state.tdiMode = "Off";
-        state.tdiStages = "4";
-        state.tdiYShift = "16";
-        state.tdiFrameCount = "10";
-        state.reverseX = false;
-        state.reverseY = false;
-        state.savePath = "Capture";
-        state.rawPath = "";
-        state.saveFormat = ".raw";
-        state.saveMode = "Single File";
-        state.stopAfterEnabled = false;
-        state.saveDuration = "5.0";
-        
-        state.appliedWidth = state.width;
-        state.appliedHeight = state.height;
+    if (m_displayModeBtn) {
+        m_displayModeBtn->setChecked(false);
+        m_fitToScreen = false;
+        setProperty("fitToScreen", false);
+    }
 
+    if (m_pixelStretchCheck) {
+        m_pixelStretchCheck->setChecked(false);
+        m_pixelStretch = false;
+        setProperty("pixelStretch", false);
+    }
+
+    if (m_saveModeToggleBtn) {
+        m_saveModeToggleBtn->setChecked(false);
+    }
+
+    setLineDelayValue(0);
+    if (m_timeDelaySpin) m_timeDelaySpin->setValue(0.0);
+    if (m_calibModeCombo) m_calibModeCombo->setCurrentIndex(0);
+
+    for (int i = 0; i < 2; ++i) {
+        applyCameraUiStateToWidgets(i);
         if (m_panels[i]) {
             for (int r = 0; r < 7; ++r) {
                 if (m_panels[i]->regionModeCombos[r])
-                    m_panels[i]->regionModeCombos[r]->setCurrentText(r == 0 ? "On" : "Off");
+                    m_panels[i]->regionModeCombos[r]->setCurrentText(regionModes[i][r]);
                 if (m_panels[i]->regionOffsetEdits[r])
-                    m_panels[i]->regionOffsetEdits[r]->setText(QString::number(defOffsets[r]));
+                    m_panels[i]->regionOffsetEdits[r]->setText(regionOffsets[i][r]);
                 if (m_panels[i]->regionBinningCombos[r])
                     m_panels[i]->regionBinningCombos[r]->setCurrentIndex(0);
             }
-            m_panels[i]->syncBinningControlsWithRegionModes();
         }
-
-        applyCameraUiStateToWidgets(i);
         updateWorkerParams(i);
     }
-    
-    setLineDelayValue(0);
-    if (m_lineDelaySpin) m_lineDelaySpin->clear();
-    if (m_timeDelaySpin) m_timeDelaySpin->setValue(0.0);
-    if (m_calibModeCombo) m_calibModeCombo->setCurrentIndex(0);
+
+    applyStyles();
+    saveSettings();
+    if (statusBar()) statusBar()->showMessage("All settings reset to default values.", 3000);
 }
 
 // ── Auto-detect cameras ───────────────────────────────────────────────
 void MainWindow::detectCameras()
 {
-    QCoreApplication::processEvents();
-    statusBar()->showMessage("Detecting KAYA frame grabbers & CoaXPress cameras...", 3000);
-    QCoreApplication::processEvents();
-
-#if !USING_STUB
-    if (m_streaming[0] || m_streaming[1] || m_connected[0] || m_connected[1])
-    {
-        statusBar()->showMessage("Stop and disconnect cameras before running detection again.", 5000);
-        return;
+    if (m_cameraManager) {
+        m_cameraManager->detectHardware();
     }
-
-    // Initialize KYFGLib
-    KYFGLib_InitParameters kyInit{};
-    kyInit.version = 2;
-    kyInit.concurrency_mode = 0;
-    kyInit.logging_mode = 0;
-    kyInit.noVideoStreamProcess = KYFALSE;
-
-    if (FGSTATUS_OK != KYFGLib_Initialize(&kyInit))
-    {
-        statusBar()->showMessage("Failed to initialize KYFGLib", 5000);
-        return;
-    }
-
-    // Close any previously opened grabbers uniquely
-    std::set<FGHANDLE> closedFgs;
-    for (FGHANDLE fg : m_fgHandles)
-    {
-        if (fg != INVALID_FGHANDLE && closedFgs.find(fg) == closedFgs.end())
-        {
-            closedFgs.insert(fg);
-            try { KYFG_Close(fg); } catch (...) {}
-        }
-    }
-    m_fgHandles.clear();
-
-    // Scan for grabbers
-    int nKayaDevicesCount = 0;
-    KY_DeviceScan(&nKayaDevicesCount);
-    if (nKayaDevicesCount == 0)
-    {
-        statusBar()->showMessage("No KAYA devices found", 5000);
-        return;
-    }
-
-    // Get device info
-    KY_DEVICE_INFO* grabbersInfoArray = (KY_DEVICE_INFO*)malloc(nKayaDevicesCount * sizeof(KY_DEVICE_INFO));
-    for (int i = 0; i < nKayaDevicesCount; ++i)
-    {
-        grabbersInfoArray[i].version = KY_MAX_DEVICE_INFO_VERSION;
-        if (FGSTATUS_OK != KY_DeviceInfo(i, &grabbersInfoArray[i]))
-        {
-            statusBar()->showMessage(QString("Failed to get info for device %1").arg(i), 5000);
-            free(grabbersInfoArray);
-            return;
-        }
-    }
-
-    m_detectedCameraCount = 0;
-    CAMHANDLE allCamHandles[KY_MAX_CAMERAS];
-    FGHANDLE allCamFgs[KY_MAX_CAMERAS];
-    QString cameraLabels[KY_MAX_CAMERAS];
-
-    // Open each grabber and scan for cameras on it
-    for (int g = 0; g < nKayaDevicesCount; ++g)
-    {
-        // Skip virtual emulator devices to only list real hardware cameras
-        QString deviceName = QString::fromLatin1(grabbersInfoArray[g].szDeviceDisplayName);
-        if (deviceName.contains("Emulator", Qt::CaseInsensitive))
-        {
-            continue;
-        }
-
-        FGHANDLE fg = KYFG_Open(g);
-        if (fg == INVALID_FGHANDLE)
-        {
-            continue;
-        }
-        m_fgHandles.push_back(fg);
-
-        // Update camera list: try twice with a small delay to ensure all camera links are fully initialized
-        CAMHANDLE devCamHandles[KY_MAX_CAMERAS];
-        int nDevCameras = KY_MAX_CAMERAS;
-        KYFG_UpdateCameraList(fg, devCamHandles, &nDevCameras);
-        QThread::msleep(200);
-        nDevCameras = KY_MAX_CAMERAS;
-        if (FGSTATUS_OK == KYFG_UpdateCameraList(fg, devCamHandles, &nDevCameras))
-        {
-            for (int c = 0; c < nDevCameras; ++c)
-            {
-                if (m_detectedCameraCount >= KY_MAX_CAMERAS)
-                    break;
-
-                allCamHandles[m_detectedCameraCount] = devCamHandles[c];
-                allCamFgs[m_detectedCameraCount] = fg;
-
-                KYFGCAMERA_INFO2 info{};
-                info.version = 1;
-                if (FGSTATUS_OK == KYFG_CameraInfo2(devCamHandles[c], &info))
-                {
-                    const QString model = QString::fromLatin1(
-                        info.deviceModelName,
-                        strnlen(info.deviceModelName, sizeof(info.deviceModelName))).trimmed();
-                    const QString firmware = QString::fromLatin1(
-                        info.deviceFirmwareVersion,
-                        strnlen(info.deviceFirmwareVersion, sizeof(info.deviceFirmwareVersion))).trimmed();
-                    cameraLabels[m_detectedCameraCount] = QString("[%1] %2%3")
-                        .arg(m_detectedCameraCount)
-                        .arg(model.isEmpty() ? QString("Camera") : model)
-                        .arg(firmware.isEmpty() ? QString() : QString(" FW %1").arg(firmware));
-                }
-                else
-                {
-                    cameraLabels[m_detectedCameraCount] = QString("[%1] Camera").arg(m_detectedCameraCount);
-                }
-
-                m_detectedCameraCount++;
-            }
-        }
-    }
-
-    free(grabbersInfoArray);
-
-    for (int i = 0; i < m_detectedCameraCount; ++i)
-    {
-        m_detectedCamHandles[i] = allCamHandles[i];
-        m_detectedCamFgs[i] = allCamFgs[i];
-    }
-
-    if (m_detectedCameraCount == 0)
-    {
-        statusBar()->showMessage("No cameras detected", 5000);
-        for (int i = 0; i < 2; ++i)
-        {
-            m_camHandles[i] = INVALID_CAMHANDLE;
-            m_panels[i]->connectBtn->setEnabled(false);
-        }
-        return;
-    }
-
-    for (int i = 0; i < 2; ++i)
-    {
-        m_camHandles[i] = INVALID_CAMHANDLE;
-        m_workers[i]->setFgHandle(INVALID_FGHANDLE);
-        m_workers[i]->setCamHandle(INVALID_CAMHANDLE);
-        m_panels[i]->setConnected(false);
-
-        const QSignalBlocker sidebarBlocker(m_sidebarSourceCombos[i]);
-        const QSignalBlocker topBlocker(m_topSourceCombos[i]);
-        m_sidebarSourceCombos[i]->clear();
-        m_topSourceCombos[i]->clear();
-        m_sidebarSourceCombos[i]->addItem("No source", -1);
-        m_topSourceCombos[i]->addItem("No source", -1);
-        for (int cam = 0; cam < m_detectedCameraCount; ++cam)
-        {
-            m_sidebarSourceCombos[i]->addItem(cameraLabels[cam], cam);
-            m_topSourceCombos[i]->addItem(cameraLabels[cam], cam);
-        }
-        m_sidebarSourceCombos[i]->setEnabled(true);
-        m_topSourceCombos[i]->setEnabled(true);
-
-        const int defaultDetectedIndex = (i < m_detectedCameraCount) ? i : -1;
-        const int comboIndex = defaultDetectedIndex >= 0
-            ? m_sidebarSourceCombos[i]->findData(defaultDetectedIndex)
-            : 0;
-        m_sidebarSourceCombos[i]->setCurrentIndex(comboIndex);
-        m_topSourceCombos[i]->setCurrentIndex(comboIndex);
-        applyCameraSourceSelection(i);
-    }
-
-    statusBar()->showMessage(QString("Detected %1 camera%2. Assign sources, then connect.")
-        .arg(m_detectedCameraCount)
-        .arg(m_detectedCameraCount == 1 ? "" : "s"), 5000);
-#else
-    constexpr int nDetectedCameras = 1;
-    for (int i = 0; i < 2; ++i)
-    {
-        m_workers[i]->setFgHandle(0);
-        m_workers[i]->setCamHandle(i < nDetectedCameras ? i : INVALID_CAMHANDLE);
-        m_panels[i]->connectBtn->setEnabled(i < nDetectedCameras);
-        m_panels[i]->setConnected(false);
-        syncSidebarButtons(i);
-    }
-    statusBar()->showMessage("Stub mode: 1 camera detected and assigned.", 3000);
-#endif
 }
 
 // ── Styles ────────────────────────────────────────────────────────────
 void MainWindow::applyStyles()
 {
-    QString stylesheet = R"(
-        /* ═══════════════════════════════════════════════════════ */
-        /* PROFESSIONAL MODERN THEME - LIGHT UI                    */
-        /* ═══════════════════════════════════════════════════════ */
-        
-        QMainWindow, QWidget {
-            background-color: #F4F6F8;
-            color: #1F2937;
-            font-family: 'Segoe UI','Ubuntu','Liberation Sans',sans-serif;
-            font-size: 11px;
-        }
-        
-        /* ─────── Dock Widget ──────────────────────────────────────── */
-        QDockWidget {
-            color: #1F2937;
-            font-weight: 600;
-            font-size: 11px;
-            border: 1px solid #DDE2E7;
-            border-radius: 4px;
-        }
-        
-        QDockWidget::title {
-            background: #ECEFF3;
-            padding: 8px 12px;
-            border-bottom: 2px solid #3B82F6;
-            text-align: left;
-            color: #1F2937;
-            font-weight: 700;
-        }
-        
-        QDockWidget::close-button, QDockWidget::float-button {
-            background: #F3F4F6;
-            border: 1px solid #DDE2E7;
-            border-radius: 3px;
-            padding: 3px;
-            subcontrol-position: top right;
-            margin-right: 2px;
-        }
-        
-        QDockWidget::close-button:hover, QDockWidget::float-button:hover {
-            background: #3B82F6;
-            border-color: #2563EB;
-            color: white;
-        }
-        
-        /* ─────── Tab Widget ───────────────────────────────────────── */
-        QTabWidget::pane {
-            border: 1px solid #DDE2E7;
-            background: #F4F6F8;
-        }
-
-        QTabBar::tab {
-            background: #ECEFF3;
-            color: #1F2937;
-            padding: 5px 14px;
-            font-weight: 600;
-            min-width: 100px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            margin-right: 2px;
-        }
-
-        QTabBar::tab:selected {
-            background: #FFFFFF;
-            color: #3B82F6;
-            border-bottom: 2px solid #3B82F6;
-        }
-
-        QTabBar::tab:hover:!selected {
-            background: #DDE2E7;
-        }
-
-        /* ─────── Toolbar ──────────────────────────────────────────── */
-        QToolBar#mainToolbar {
-            background: #ECEFF3;
-            border-bottom: 1px solid #DDE2E7;
-            padding: 6px 8px;
-        }
-
-        QFrame#capsuleGroup {
-            background: #ffffff;
-            border: 1px solid #d0d7de;
-            border-radius: 12px;
-            padding: 2px 4px;
-        }
-
-        #capsuleLabel {
-            font-size: 10px;
-            font-weight: 700;
-            color: #57606a;
-            padding: 0 4px;
-        }
-
-        QToolBar#mainToolbar QPushButton {
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 10.5px;
-            font-weight: 600;
-            min-height: 16px;
-            max-height: 20px;
-        }
-
-        #appNameBtn {
-            font-size: 11px;
-            font-weight: 700;
-            padding: 1px 6px;
-            border-radius: 4px;
-        }
-        
-        #appName {
-            font-size: 12px;
-            font-weight: bold;
-            color: #3B82F6;
-        }
-        
-        #tbDiv {
-            background: #DDE2E7;
-            max-width: 1px;
-            min-width: 1px;
-            margin: 4px 6px;
-        }
-        
-        #syncLabel {
-            color: #F59E0B;
-            font-weight: bold;
-            font-size: 11px;
-        }
-        
-        #syncStatus {
-            color: #3B82F6;
-            font-size: 10px;
-        }
-        
-        /* ─────── View Dock Internals ──────────────────────────────── */
-        #viewBar {
-            background: #ECEFF3;
-            border-bottom: 1px solid #DDE2E7;
-        }
-        
-        #viewBarTitle {
-            color: #1F2937;
-            font-size: 10px;
-            font-weight: 600;
-        }
-        
-        #viewWidget {
-            background: #FFFFFF;
-        }
-        
-        #centerPlaceholder, #viewHost {
-            background: #F4F6F8;
-        }
-
-        #sidebarScroll {
-            background: #F4F6F8;
-            border: none;
-        }
-
-        #offlineToolbar {
-            background: #ECEFF3;
-            border-bottom: 1px solid #DDE2E7;
-        }
-
-        #offlineHost {
-            background: #F4F6F8;
-            border-top: 1px solid #DDE2E7;
-        }
-
-        #operatorPanel {
-            background: transparent;
-        }
-
-        #operatorCard {
-            background: #FFFFFF;
-            border: 1px solid #DDE2E7;
-            border-radius: 6px;
-        }
-
-        #operatorTitle {
-            color: #3B82F6;
-            font-weight: 700;
-            font-size: 11px;
-        }
-
-        #operatorState {
-            color: #6B7280;
-            font-size: 10px;
-        }
-
-        #compactLabel {
-            color: #6B7280;
-            font-size: 10px;
-            font-weight: 600;
-        }
-
-        #compactEdit {
-            min-height: 18px;
-        }
-        
-        /* ─────── Camera Panel ─────────────────────────────────────── */
-        #cameraPanel {
-            background: #FFFFFF;
-            border: 1px solid #DDE2E7;
-            border-radius: 6px;
-        }
-        
-        #panelTitle {
-            font-size: 12px;
-            font-weight: bold;
-            color: #3B82F6;
-            padding: 8px;
-            background: #ECEFF3;
-            border-bottom: 1px solid #DDE2E7;
-            border-radius: 3px 3px 0 0;
-        }
-        
-        #fpsLabel {
-            color: #22C55E;
-            font-weight: bold;
-            font-size: 10px;
-        }
-        
-        #separator {
-            color: #E5E7EB;
-            max-height: 1px;
-            background: #e0e0e0;
-        }
-        
-        /* ─────── Labels ───────────────────────────────────────────── */
-        QLabel {
-            color: #34495e;
-            font-weight: 500;
-        }
-        
-        /* ─────── Input Fields ─────────────────────────────────────── */
-        QLineEdit, #compactEdit {
-            background: #ffffff;
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            padding: 4px 6px;
-            color: #2c3e50;
-            selection-background-color: #3498db;
-            font-size: 11px;
-        }
-
-        QLineEdit:disabled, #compactEdit:disabled {
-            background-color: #e9ecef;
-            color: #adb5bd;
-            border: 1px solid #ced4da;
-        }
-        
-        QLineEdit:focus {
-            border: 2px solid #3498db;
-            padding: 5px 7px;
-            background: #f0f7ff;
-        }
-        
-        QLineEdit::placeholder-text {
-            color: #95a5a6;
-        }
-        
-        QComboBox, #compactCombo {
-            background: #ffffff;
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            padding: 4px 6px;
-            color: #2c3e50;
-            font-size: 11px;
-        }
-
-        QComboBox:disabled, #compactCombo:disabled {
-            background-color: #e9ecef;
-            color: #adb5bd;
-            border: 1px solid #ced4da;
-        }
-        
-        QComboBox:focus {
-            border: 2px solid #3498db;
-            padding: 5px 7px;
-            background: #f0f7ff;
-        }
-        
-        QComboBox::down-arrow {
-            image: none;
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-top: 5px solid #3498db;
-            width: 0px;
-            height: 0px;
-        }
-        
-        QComboBox QAbstractItemView {
-            background: #ffffff;
-            border: 1px solid #bdc3c7;
-            selection-background-color: #3498db;
-            color: #2c3e50;
-        }
-        
-        QDoubleSpinBox {
-            background: #ffffff;
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            padding: 3px 4px;
-            color: #2c3e50;
-            font-size: 11px;
-        }
-
-        QDoubleSpinBox:disabled {
-            background-color: #e9ecef;
-            color: #adb5bd;
-            border: 1px solid #ced4da;
-        }
-        
-        QDoubleSpinBox:focus {
-            border: 2px solid #3498db;
-            background: #f0f7ff;
-        }
-        
-        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-            background: #ecf0f1;
-            border: 1px solid #bdc3c7;
-            border-radius: 2px;
-            width: 20px;
-        }
-        
-        QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-            background: #3498db;
-        }
-        
-        /* ─────── Group Box ────────────────────────────────────────── */
-        QGroupBox {
-            border: 1px solid #e0e0e0;
-            border-radius: 4px;
-            margin-top: 10px;
-            padding-top: 6px;
-            color: #2980b9;
-            font-weight: 600;
-        }
-        
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 3px;
-        }
-        
-        /* ─────── Checkbox ─────────────────────────────────────────── */
-        QCheckBox {
-            color: #34495e;
-            spacing: 6px;
-        }
-
-        QCheckBox:disabled {
-            color: #adb5bd;
-        }
-        
-        QCheckBox::indicator {
-            width: 16px;
-            height: 16px;
-            border: 2px solid #bdc3c7;
-            border-radius: 3px;
-            background: #ffffff;
-        }
-
-        QCheckBox::indicator:disabled {
-            background: #e9ecef;
-            border: 1px solid #ced4da;
-        }
-        
-        QCheckBox::indicator:hover {
-            border: 2px solid #3498db;
-        }
-        
-        QCheckBox::indicator:checked {
-            background: #3498db;
-            border: 2px solid #bdc3c7;
-        }
-
-        QCheckBox::indicator:checked:hover {
-            background: #2980b9;
-            border: 2px solid #3498db;
-        }
-        
-        /* ─────── Buttons ──────────────────────────────────────────── */
-        QPushButton {
-            background: #ecf0f1;
-            color: #34495e;
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            padding: 3px 8px;
-            font-weight: 600;
-            font-size: 11px;
-            min-height: 16px;
-        }
-        
-        QPushButton:hover {
-            background: #d5d8dc;
-            border-color: #95a5a6;
-            color: #2c3e50;
-        }
-        
-        QPushButton:pressed {
-            background: #bdc3c7;
-            border-color: #7f8c8d;
-            color: #212529;
-        }
-        
-        QPushButton:disabled,
-        #presetBtn:disabled,
-        #resetBtn:disabled,
-        #connectBtn:disabled,
-        #connectAllBtn:disabled,
-        #startBtn:disabled,
-        #startAllBtn:disabled,
-        #saveBtn:disabled,
-        #saveAllBtn:disabled,
-        #syncBtn:disabled,
-        #detectBtn:disabled,
-        #modeToggleBtn:disabled,
-        #floatBtn:disabled {
-            background-color: #e9ecef;
-            color: #adb5bd;
-            border: 1px solid #ced4da;
-        }
-        
-        /* ───── Action Buttons ───────────────────────────────────────── */
-        #connectBtn, #connectAllBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #27ae60, stop:1 #229954);
-            color: white;
-            border: 1px solid #1e8449;
-            font-weight: 700;
-        }
-        
-        #connectBtn:hover, #connectAllBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #2ecc71, stop:1 #27ae60);
-        }
-        
-        #connectBtn:pressed, #connectAllBtn:pressed {
-            background: #1e8449;
-        }
-        
-        #connectBtn[connected="true"], #connectAllBtn[connected="true"] {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #e74c3c, stop:1 #c0392b);
-            border-color: #a93226;
-        }
-        
-        #connectBtn[connected="true"]:hover, #connectAllBtn[connected="true"]:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #ec7063, stop:1 #c0392b);
-        }
-        
-        #detectBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #475569, stop:1 #334155);
-            color: white;
-            border: 1px solid #1e293b;
-            font-weight: 700;
-        }
-        
-        #detectBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #64748b, stop:1 #475569);
-        }
-
-        #modeToggleBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #5b7290, stop:1 #475870);
-            color: white;
-            border: 1px solid #3b4b60;
-            font-weight: 700;
-        }
-        
-        #modeToggleBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #6d85a4, stop:1 #475870);
-        }
-        
-        #startBtn, #startAllBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #2563eb, stop:1 #1d4ed8);
-            color: white;
-            border: 1px solid #1e40af;
-            font-weight: 700;
-        }
-        
-        #startBtn:hover, #startAllBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #3b82f6, stop:1 #1d4ed8);
-        }
-        
-        #startBtn:pressed, #startAllBtn:pressed {
-            background: #1d4ed8;
-        }
-        
-        #startBtn[streaming="true"], #startAllBtn[streaming="true"] {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #f39c12, stop:1 #d68910);
-            border-color: #b5690f;
-        }
-        
-        #startBtn[streaming="true"]:hover, #startAllBtn[streaming="true"]:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #f5ad3d, stop:1 #d68910);
-        }
-        
-        #saveBtn, #saveAllBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #9333ea, stop:1 #7e22ce);
-            color: white;
-            border: 1px solid #6b21a8;
-            font-weight: 700;
-        }
-        
-        #saveBtn:hover, #saveAllBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #a855f7, stop:1 #7e22ce);
-        }
-        
-        #saveBtn[saving="true"], #saveAllBtn[saving="true"] {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #be185d, stop:1 #9d174d);
-            border-color: #831843;
-        }
-        
-        #saveBtn[saving="true"]:hover, #saveAllBtn[saving="true"]:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #db2777, stop:1 #9d174d);
-        }
-        
-        #syncBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #e67e22, stop:1 #d35400);
-            color: white;
-            border: 1px solid #ba4a00;
-            font-weight: 700;
-        }
-        
-        #syncBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #f39c12, stop:1 #d35400);
-        }
-        
-        #floatBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #9b59b6, stop:1 #8e44ad);
-            color: white;
-            border: 1px solid #7d3c98;
-            font-weight: 700;
-        }
-        
-        #floatBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #af7ac5, stop:1 #8e44ad);
-        }
-        
-        #presetBtn {
-            background: #ecf0f1;
-            border-color: #bdc3c7;
-            color: #34495e;
-            font-size: 10px;
-            padding: 2px 6px;
-            min-height: 16px;
-        }
-        
-        #presetBtn:hover {
-            background: #d5d8dc;
-            border-color: #95a5a6;
-            color: #2c3e50;
-        }
-        
-        #resetBtn {
-            background: #ecf0f1;
-            border-color: #bdc3c7;
-            color: #34495e;
-            font-size: 10px;
-            padding: 2px 6px;
-            min-height: 16px;
-        }
-        
-        #resetBtn:hover {
-            background: #d5d8dc;
-            border-color: #95a5a6;
-        }
-
-        #presetBtn:disabled, #resetBtn:disabled {
-            background-color: #e9ecef;
-            color: #adb5bd;
-            border: 1px solid #ced4da;
-        }
-        
-        #smallBtn {
-            padding: 2px 4px;
-            font-size: 10px;
-            min-height: 16px;
-        }
-        
-        #toggleBtn {
-            background: #ffffff;
-            border: 1px solid #bdc3c7;
-            color: #34495e;
-            text-align: left;
-            padding-left: 8px;
-            border-radius: 3px;
-        }
-        
-        #toggleBtn:hover {
-            border-color: #3498db;
-            color: #2980b9;
-            background: #f0f7ff;
-        }
-        
-        #exitBtn {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #e74c3c, stop:1 #c0392b);
-            color: white;
-            border: 1px solid #a93226;
-            font-weight: 700;
-            font-size: 10px;
-            padding: 0px;
-            border-radius: 4px;
-        }
-        
-        #exitBtn:hover {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #ec7063, stop:1 #c0392b);
-        }
-        
-        /* ─────── Status and Display ───────────────────────────────── */
-        #statusLabel {
-            color: #34495e;
-            font-size: 10px;
-            border-top: 1px solid #e0e0e0;
-            padding: 6px 8px;
-            background: #fafafa;
-        }
-        
-        #scrollArea {
-            background: #ffffff;
-            border: none;
-        }
-
-        #logTerminal {
-            background: #ffffff;
-            color: #2c3e50;
-            border-top: 1px solid #d5d8dc;
-            font-family: "DejaVu Sans Mono","Consolas","Monaco",monospace;
-            font-size: 10px;
-            padding: 4px;
-        }
-        
-        #imageLabel {
-            background: #f8f9fa;
-            color: #95a5a6;
-            font-size: 16px;
-            font-weight: bold;
-        }
-        
-        /* ─────── Scrollbars ───────────────────────────────────────── */
-        QScrollBar:vertical, QScrollBar:horizontal {
-            background: #f0f0f0;
-            width: 10px;
-            height: 10px;
-        }
-        
-        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-            background: #bdc3c7;
-            border-radius: 5px;
-            min-height: 20px;
-            min-width: 20px;
-        }
-        
-        QScrollBar::handle:hover {
-            background: #95a5a6;
-        }
-        
-        QScrollBar::add-line, QScrollBar::sub-line {
-            background: none;
-            border: none;
-        }
-        
-        /* ─────── Status Bar ───────────────────────────────────────── */
-        QStatusBar {
-            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                stop:0 #ffffff, stop:1 #f8f9fa);
-            color: #34495e;
-            font-size: 10px;
-            border-top: 1px solid #d5d8dc;
-        }
-    )";
-
-    if (m_darkMode)
-    {
-        stylesheet += R"(
-        QMainWindow, QWidget {
-            background-color: #101010;
-            color: #f0f0f0;
-        }
-
-        /* ─────── Tab Widget ───────────────────────────────────────── */
-        QTabWidget::pane {
-            border: 1px solid #2e2e2e;
-            background: #101010;
-        }
-
-        QTabBar::tab {
-            background: #1c1c1c;
-            color: #8b949e;
-            padding: 6px 14px;
-            font-weight: 600;
-            min-width: 100px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            margin-right: 2px;
-        }
-
-        QTabBar::tab:selected {
-            background: #262626;
-            color: #f0f0f0;
-            border-bottom: 2px solid #c9a15d;
-        }
-
-        QTabBar::tab:hover:!selected {
-            background: #222222;
-            color: #c9a15d;
-        }
-
-        QToolBar#mainToolbar {
-            background: #1c1c1c;
-            border-bottom: 1px solid #2e2e2e;
-            padding: 6px 8px;
-        }
-
-        QFrame#capsuleGroup {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 12px;
-            padding: 2px 4px;
-        }
-
-        #capsuleLabel {
-            font-size: 10px;
-            font-weight: 700;
-            color: #8b949e;
-            padding: 0 4px;
-        }
-
-        QToolBar#mainToolbar QPushButton {
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 10.5px;
-            font-weight: 600;
-            min-height: 16px;
-            max-height: 20px;
-        }
-
-        #appNameBtn {
-            font-size: 11px;
-            font-weight: 700;
-            padding: 1px 6px;
-            border-radius: 4px;
-        }
-
-        #appName {
-            color: #c9a15d;
-        }
-
-        #tbDiv {
-            background: #2e2e2e;
-        }
-
-        #syncLabel {
-            color: #c9a15d;
-        }
-
-        #syncStatus {
-            color: #9b9b9b;
-        }
-
-        #viewBar {
-            background: #1c1c1c;
-            border-bottom: 1px solid rgba(255,255,255,0.08);
-        }
-
-        #viewBarTitle, QLabel {
-            color: #f0f0f0;
-            background: transparent;
-        }
-
-        #centerPlaceholder, #viewHost, #viewWidget, #scrollArea, #sidebarScroll {
-            background: #0c0c0c;
-        }
-
-        #sidebarContent, #operatorPanel, #topControlsHost, #sidebarScroll > QWidget {
-            background: #101010;
-        }
-
-        #offlineToolbar {
-            background: #1c1c1c;
-            border-bottom: 1px solid #2e2e2e;
-        }
-
-        #offlineHost {
-            background: #101010;
-            border-top: 1px solid #2e2e2e;
-        }
-
-        #operatorCard, #cameraPanel, QGroupBox {
-            background: #1c1c1c;
-            border: 1px solid rgba(255,255,255,0.08);
-            color: #f0f0f0;
-        }
-
-        #operatorTitle, #panelTitle {
-            color: #c9a15d;
-            background: transparent;
-            border: none;
-        }
-
-        #operatorState, #compactLabel, #statusLabel {
-            color: #94a3b8;
-            background: transparent;
-        }
-
-        #viewBarTitle, #modeSideLabel, #syncLabel, #syncStatus,
-        #fpsLabel, #sensorTempLabel, #grabberTempLabel {
-            background: transparent;
-        }
-
-        QLineEdit, #compactEdit, QComboBox, #compactCombo, QDoubleSpinBox {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.12);
-            color: #f0f0f0;
-        }
-
-        QLineEdit:disabled, #compactEdit:disabled,
-        QComboBox:disabled, #compactCombo:disabled,
-        QDoubleSpinBox:disabled {
-            background-color: rgba(255,255,255,0.02);
-            border: 1px solid rgba(255,255,255,0.06);
-            color: rgba(255,255,255,0.22);
-        }
-
-        QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
-            background: rgba(255,255,255,0.04);
-            border: 2px solid #c9a15d;
-        }
-
-        QComboBox QAbstractItemView {
-            background: #1c1c1c;
-            border: 1px solid rgba(255,255,255,0.12);
-            selection-background-color: rgba(200, 164, 95, 0.35);
-            color: #f0f0f0;
-        }
-
-        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.16);
-        }
-
-        QPushButton {
-            background: rgba(255,255,255,0.08);
-            color: #f0f0f0;
-            border: 1px solid rgba(255,255,255,0.16);
-            border-radius: 6px;
-        }
-
-        QPushButton:hover {
-            background: rgba(255,255,255,0.12);
-            border-color: rgba(255,255,255,0.20);
-            color: #ffffff;
-        }
-
-        QPushButton:disabled,
-        #presetBtn:disabled,
-        #resetBtn:disabled,
-        #toggleBtn:disabled,
-        #detectBtn:disabled,
-        #connectBtn:disabled,
-        #connectAllBtn:disabled,
-        #startBtn:disabled,
-        #startAllBtn:disabled,
-        #saveBtn:disabled,
-        #saveAllBtn:disabled,
-        #syncBtn:disabled,
-        #floatBtn:disabled,
-        #modeToggleBtn:disabled {
-            background-color: rgba(255,255,255,0.02);
-            color: rgba(255,255,255,0.22);
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-
-        #presetBtn, #resetBtn {
-            background: rgba(255,255,255,0.08);
-            border-color: rgba(255,255,255,0.14);
-            color: #f0f0f0;
-        }
-
-        #presetBtn:hover, #resetBtn:hover {
-            background: rgba(255,255,255,0.14);
-            border-color: rgba(255,255,255,0.20);
-            color: #ffffff;
-        }
-
-        #presetBtn:disabled, #resetBtn:disabled {
-            background-color: rgba(255,255,255,0.02);
-            color: rgba(255,255,255,0.22);
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-
-        #toggleBtn {
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.16);
-            color: #f0f0f0;
-        }
-
-        #toggleBtn:hover {
-            border-color: #c9a15d;
-            color: #c9a15d;
-            background: rgba(255,255,255,0.12);
-        }
-
-        #detectBtn {
-            background: #374151;
-            border: 1px solid rgba(75, 85, 99, 0.55);
-            color: #f3f4f6;
-        }
-
-        #detectBtn:hover {
-            background: #4b5563;
-        }
-
-        #modeToggleBtn {
-            background: #4b5563;
-            border: 1px solid rgba(107, 114, 128, 0.45);
-            color: #f4f7fb;
-        }
-
-        #modeToggleBtn:hover {
-            background: #6b7280;
-        }
-
-        #connectAllBtn, #connectBtn {
-            background: #2e7d32;
-            border: 1px solid rgba(76, 175, 80, 0.45);
-            color: #e8f5e9;
-            font-weight: 700;
-        }
-
-        #connectAllBtn:hover, #connectBtn:hover {
-            background: #388e3c;
-        }
-
-        #connectBtn[connected="true"], #connectAllBtn[connected="true"] {
-            background: #a63636;
-            border-color: rgba(183,90,90,0.55);
-            color: #ffffff;
-        }
-
-        #connectBtn[connected="true"]:hover, #connectAllBtn[connected="true"]:hover {
-            background: #b84a4a;
-        }
-
-        #startBtn, #startAllBtn {
-            background: #1e40af;
-            border: 1px solid rgba(59, 130, 246, 0.45);
-            color: #eef3ff;
-            font-weight: 700;
-        }
-
-        #startBtn:hover, #startAllBtn:hover {
-            background: #2563eb;
-        }
-
-        #startBtn[streaming="true"], #startAllBtn[streaming="true"] {
-            background: #d27f2b;
-            border-color: rgba(210,140,81,0.55);
-            color: #ffffff;
-        }
-
-        #startBtn[streaming="true"]:hover, #startAllBtn[streaming="true"]:hover {
-            background: #de9147;
-        }
-
-        #saveBtn, #saveAllBtn {
-            background: #6b21a8;
-            border: 1px solid rgba(147, 51, 234, 0.45);
-            color: #f3e8ff;
-            font-weight: 700;
-        }
-
-        #saveBtn:hover, #saveAllBtn:hover {
-            background: #7e22ce;
-        }
-
-        #saveBtn[saving="true"], #saveAllBtn[saving="true"] {
-            background: #9d174d;
-            border-color: rgba(190, 24, 93, 0.55);
-            color: #ffffff;
-        }
-
-        #saveBtn[saving="true"]:hover, #saveAllBtn[saving="true"]:hover {
-            background: #be185d;
-        }
-
-        #floatBtn {
-            background: #52525b;
-            border: 1px solid rgba(113, 113, 122, 0.45);
-            color: #f4f4f5;
-        }
-
-        #floatBtn:hover {
-            background: #71717a;
-        }
-
-        #syncBtn {
-            background: #7a5537;
-            border: 1px solid rgba(140,101,65,0.45);
-            color: #f6e4c8;
-        }
-
-        #syncBtn:hover {
-            background: #8f6b4d;
-        }
-
-        QCheckBox {
-            color: #f0f0f0;
-            background: transparent;
-        }
-
-        QCheckBox:disabled {
-            color: rgba(255,255,255,0.22);
-        }
-
-        QCheckBox::indicator {
-            background: #1f2937;
-            border: 1px solid #64748b;
-        }
-
-        QCheckBox::indicator:disabled {
-            background: rgba(255,255,255,0.02);
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-
-        QCheckBox::indicator:hover {
-            border-color: #c9a15d;
-        }
-
-        QCheckBox::indicator:checked {
-            background: #22c55e;
-            border-color: #64748b;
-        }
-
-        QCheckBox::indicator:checked:hover {
-            background: #16a34a;
-            border-color: #c9a15d;
-        }
-
-        #imageLabel {
-            background: #0c0c0c;
-            color: #9b9b9b;
-        }
-
-        #logTerminal {
-            background: #0c0c0c;
-            color: #d6d6d6;
-            border-top: 1px solid #2e2e2e;
-            font-family: "DejaVu Sans Mono","Consolas","Monaco",monospace;
-            font-size: 10px;
-            padding: 4px;
-        }
-
-        #fpsLabel {
-            color: #7fbf8f;
-        }
-
-        #separator {
-            color: rgba(255,255,255,0.08);
-            background: rgba(255,255,255,0.08);
-        }
-
-        QScrollBar:vertical, QScrollBar:horizontal {
-            background: #101010;
-        }
-
-        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-            background: #2e2e2e;
-        }
-
-        QScrollBar::handle:hover {
-            background: #3a3a3a;
-        }
-
-        QStatusBar {
-            background: #1c1c1c;
-            color: #f0f0f0;
-            border-top: 1px solid #2e2e2e;
-        }
-        )";
-    }
-
-    setStyleSheet(stylesheet);
-
-    if (qApp) {
-        qApp->setStyleSheet(stylesheet);
-        for (QWidget* w : qApp->allWidgets()) {
-            w->style()->unpolish(w);
-            w->style()->polish(w);
-            w->update();
-        }
-    }
+    ThemeManager::applyTheme(this, m_darkMode);
 
 #ifdef HAS_OFFLINE_VIEWER
     if (m_offlineViewer) {
@@ -5832,64 +3508,64 @@ void MainWindow::applyStyles()
 
 void MainWindow::onStartCalibrationClicked()
 {
-    if (m_calibrationMode) {
-        // Stop calibration
-        m_calibrationMode = false;
-        m_startCalibrationBtn->setText(" Start ");
-        m_markCam1Btn->setVisible(false);
-        m_markCam2Btn->setVisible(false);
-        m_calibModeCombo->setEnabled(true);
+    if (!m_calibrationEngine) return;
+
+    if (m_calibrationEngine->isCalibrating()) {
+        m_calibrationEngine->stopCalibration();
+        if (m_startCalibrationBtn) m_startCalibrationBtn->setText(" Start ");
+        if (m_markCam1Btn) m_markCam1Btn->setVisible(false);
+        if (m_markCam2Btn) m_markCam2Btn->setVisible(false);
+        if (m_calibModeCombo) m_calibModeCombo->setEnabled(true);
     } else {
         if (!m_streaming[0] || !m_streaming[1]) {
             QMessageBox::warning(this, "Calibration", "Please start streaming BOTH cameras before starting calibration.");
             return;
         }
-        
-        // Start calibration
-        m_calibrationMode = true;
+
+        bool isAutoDetect = (m_calibModeCombo && m_calibModeCombo->currentIndex() == 2);
         setLineDelayValue(0);
         if (m_timeDelaySpin) m_timeDelaySpin->setValue(0.0);
-        m_cam1MarkLines = 0;
-        m_cam2MarkLines = 0;
-        m_autoCam1Detected = false;
-        m_autoCam2Detected = false;
-        m_calibModeCombo->setEnabled(false);
-        
-        if (m_calibModeCombo->currentIndex() == 2) { // Auto Detect
-            m_startCalibrationBtn->setText(" Waiting for CAM1... ");
-            m_markCam1Btn->setVisible(false);
-            m_markCam2Btn->setVisible(false);
+        if (m_calibModeCombo) m_calibModeCombo->setEnabled(false);
+
+        m_calibrationEngine->startCalibration(isAutoDetect);
+
+        if (isAutoDetect) {
+            if (m_startCalibrationBtn) m_startCalibrationBtn->setText(" Waiting for CAM1... ");
+            if (m_markCam1Btn) m_markCam1Btn->setVisible(false);
+            if (m_markCam2Btn) m_markCam2Btn->setVisible(false);
         } else {
-            // Manual Mark
-            m_startCalibrationBtn->setText(" Stop ");
-            m_markCam1Btn->setText(" 🎯 MARK CAM1 LINE ");
-            m_markCam1Btn->setEnabled(true);
-            m_markCam1Btn->setVisible(true);
-            
-            m_markCam2Btn->setText(" 🎯 MARK CAM2 LINE ");
-            m_markCam2Btn->setEnabled(false);
-            m_markCam2Btn->setVisible(true);
+            if (m_startCalibrationBtn) m_startCalibrationBtn->setText(" Stop ");
+            if (m_markCam1Btn) {
+                m_markCam1Btn->setText(" 🎯 MARK CAM1 LINE ");
+                m_markCam1Btn->setEnabled(true);
+                m_markCam1Btn->setVisible(true);
+            }
+            if (m_markCam2Btn) {
+                m_markCam2Btn->setText(" 🎯 MARK CAM2 LINE ");
+                m_markCam2Btn->setEnabled(false);
+                m_markCam2Btn->setVisible(true);
+            }
         }
     }
 }
 
 void MainWindow::onMarkCam1Clicked()
 {
-    m_cam1MarkLines = m_totalLinesReceived[0];
-    m_markCam1Btn->setText(" ✔ CAM1 Marked ");
-    m_markCam1Btn->setEnabled(false);
-    
-    m_markCam2Btn->setEnabled(true);
+    if (!m_calibrationEngine) return;
+    m_calibrationEngine->markCam1();
+    if (m_markCam1Btn) {
+        m_markCam1Btn->setText(" ✔ CAM1 Marked ");
+        m_markCam1Btn->setEnabled(false);
+    }
+    if (m_markCam2Btn) {
+        m_markCam2Btn->setEnabled(true);
+    }
 }
 
 void MainWindow::onMarkCam2Clicked()
 {
-    m_cam2MarkLines = m_totalLinesReceived[1];
-    
-    qint64 diff = m_cam2MarkLines - m_cam1MarkLines;
-    
-    setLineDelayValue(diff);
-    
+    if (!m_calibrationEngine) return;
+    m_calibrationEngine->markCam2();
     if (m_calibModeCombo) m_calibModeCombo->setCurrentIndex(0);
 }
 
@@ -5920,4 +3596,9 @@ int MainWindow::getActiveRegionOffset(int idx) const
         }
     }
     return 0;
+}
+
+bool MainWindow::isMergeSaving() const
+{
+    return m_captureController && m_captureController->isMergeSaving();
 }
