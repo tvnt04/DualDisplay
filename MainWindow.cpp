@@ -236,7 +236,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     m_calibrationEngine = new CalibrationEngine(this);
 
     // CameraManager wiring
-    connect(m_cameraManager, &CameraManager::frameReady,       this, &MainWindow::onFrameReady,       Qt::QueuedConnection);
+    // CameraManager relays frames from its GUI-thread slot, so AutoConnection
+    // avoids adding another queued hop before the UI can display the frame.
+    connect(m_cameraManager, &CameraManager::frameReady,       this, &MainWindow::onFrameReady,       Qt::AutoConnection);
     connect(m_cameraManager, &CameraManager::logMessage,       this, &MainWindow::onLogMessage,       Qt::QueuedConnection);
     connect(m_cameraManager, &CameraManager::streamStarted,    this, &MainWindow::onStreamStarted,    Qt::QueuedConnection);
     connect(m_cameraManager, &CameraManager::streamStopped,    this, &MainWindow::onStreamStopped,    Qt::QueuedConnection);
@@ -1624,7 +1626,7 @@ void MainWindow::buildUI()
     QHBoxLayout* appCapLay = qobject_cast<QHBoxLayout*>(m_appCap->layout());
     appCapLay->setContentsMargins(4, 2, 4, 2);
 
-    m_appNameBtn = new QPushButton("Xdlinx Display Tool");
+    m_appNameBtn = new QPushButton(APP_NAME);
     m_appNameBtn->setObjectName("appNameBtn");
     m_appNameBtn->setFixedHeight(22);
     m_appNameBtn->setIconSize(QSize(24, 14));
@@ -2283,17 +2285,10 @@ void MainWindow::refreshDisplay(int idx)
     }
 
     QImage previewImg(previewData, previewW, previewH, previewW, QImage::Format_Grayscale8);
-    QSize targetSize;
-    if (zoom <= 1.0) {
-        targetSize = (aspectMode == Qt::KeepAspectRatio)
-            ? previewImg.scaled(viewSize, Qt::KeepAspectRatio, Qt::FastTransformation).size()
-            : viewSize;
-    } else {
-        QSize baseSize = (aspectMode == Qt::KeepAspectRatio)
-            ? previewImg.scaled(viewSize, Qt::KeepAspectRatio, Qt::FastTransformation).size()
-            : viewSize;
-        targetSize = baseSize * zoom;
-    }
+    const QSize baseSize = (aspectMode == Qt::KeepAspectRatio)
+        ? previewImg.size().scaled(viewSize, Qt::KeepAspectRatio)
+        : viewSize;
+    QSize targetSize = (zoom <= 1.0) ? baseSize : baseSize * zoom;
 
     if (targetSize.width() <= 0 || targetSize.height() <= 0) {
         targetSize = viewSize;
@@ -3361,10 +3356,15 @@ void MainWindow::onConnectAllClicked()
             }
         }
     } else {
-        for (int i = 0; i < 2; ++i) {
-            if (!m_connected[i]) {
-                onConnectClicked(i);
-            }
+        if (!m_connected[0]) {
+            onConnectClicked(0);
+        }
+        if (!m_connected[1]) {
+            QTimer::singleShot(250, this, [this]() {
+                if (!m_connected[1]) {
+                    onConnectClicked(1);
+                }
+            });
         }
     }
 }
@@ -3528,7 +3528,8 @@ void MainWindow::onFrameReady(FramePacketPtr pkt)
     }
 
     double cameraFps = std::max(0.1, m_cameraUiStates[idx].fps.toDouble());
-    const int limitMs = std::max(33, static_cast<int>(1000.0 / cameraFps) - 5);
+    // Match the camera cadence instead of imposing a 30 Hz display ceiling.
+    const int limitMs = std::max(1, static_cast<int>(1000.0 / cameraFps) - 5);
     const bool updateDisplay = (m_lastDisplayMs[idx] == 0 || now - m_lastDisplayMs[idx] >= limitMs);
     if (updateDisplay) {
         m_lastDisplayMs[idx] = now;
@@ -4109,22 +4110,31 @@ void MainWindow::detectCameras()
 
     DetectionProgressDialog dlg(this, m_darkMode);
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
+    auto conn = std::make_shared<QMetaObject::Connection>();
+    *conn = connect(m_cameraManager, &CameraManager::hardwareDetected, this, [&dlg, conn](int, const QStringList&) {
+        if (*conn) {
+            QObject::disconnect(*conn);
+        }
+        dlg.allowClose();
+    });
 
-    QThread* thread = QThread::create([this]() {
-        if (m_cameraManager) {
-            m_cameraManager->detectHardware();
+    QTimer::singleShot(15000, &dlg, [&dlg, conn, this]() {
+        if (dlg.isVisible()) {
+            if (*conn) {
+                QObject::disconnect(*conn);
+            }
+            dlg.allowClose();
+            if (statusBar()) statusBar()->showMessage("Hardware detection timed out.", 5000);
         }
     });
 
-    connect(thread, &QThread::finished, &dlg, [&dlg]() {
-        dlg.allowClose();
-    }, Qt::QueuedConnection);
-    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-
-    thread->start();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    m_cameraManager->detectHardware();
     dlg.exec();
 
+    if (*conn) {
+        QObject::disconnect(*conn);
+    }
     QApplication::restoreOverrideCursor();
 
     if (m_detectBtn) m_detectBtn->setEnabled(true);

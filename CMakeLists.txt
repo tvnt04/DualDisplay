@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.14)
-project(XDT VERSION 1.4.1 LANGUAGES CXX)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/AppVersion.h" _APP_VER_LINE REGEX "^#define[ \t]+APP_VERSION[ \t]+\"")
+if(_APP_VER_LINE MATCHES "\"([0-9.]+)\"")
+    set(APP_VERSION_EXTRACTED "${CMAKE_MATCH_1}")
+else()
+    set(APP_VERSION_EXTRACTED "1.0.0")
+endif()
+
+project(XDT VERSION ${APP_VERSION_EXTRACTED} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 

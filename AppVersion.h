@@ -6,5 +6,5 @@
 #define APP_VERSION_MINOR 0
 #define APP_VERSION_PATCH 0
 
-#define APP_TITLE_STRING "Xdlinx Display Tool - 1.0.0"
+#define APP_TITLE_STRING APP_NAME " v" APP_VERSION
 

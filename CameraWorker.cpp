@@ -881,7 +881,14 @@ void CameraWorker::openCamera()
             auto status = KYFG_CameraOpen2(m_camHandle, NULL);
             if (status != FGSTATUS_OK)
             {
-                emit errorOccurred(m_camIndex, QString("Camera #%1 was not connected successfully").arg(m_camIndex));
+                // If camera link was left locked/open by a previous crash, close it and retry
+                KYFG_CameraClose(m_camHandle);
+                QThread::msleep(100);
+                status = KYFG_CameraOpen2(m_camHandle, NULL);
+            }
+            if (status != FGSTATUS_OK)
+            {
+                emit errorOccurred(m_camIndex, QString("Camera #%1 was not connected successfully (status: 0x%2)").arg(m_camIndex).arg(status, 0, 16));
                 return;
             }
             m_cameraOpened = true;
@@ -902,6 +909,7 @@ void CameraWorker::openCamera()
         auto status = KYFG_StreamCreate(m_camHandle, &m_streamHandle, 0);
         if (status != FGSTATUS_OK || m_streamHandle == INVALID_STREAMHANDLE)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 stream create failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -909,9 +917,8 @@ void CameraWorker::openCamera()
         status = KYFG_StreamBufferCallbackRegister(m_streamHandle, streamCallback, this);
         if (status != FGSTATUS_OK)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 callback register failed: %2").arg(m_camIndex).arg(status));
-            KYFG_StreamDelete(m_streamHandle);
-            m_streamHandle = INVALID_STREAMHANDLE;
             return;
         }
         {
@@ -925,6 +932,7 @@ void CameraWorker::openCamera()
         status = KYFG_StreamGetInfo(m_streamHandle, KY_STREAM_INFO_PAYLOAD_SIZE, &frameDataSize, NULL, NULL);
         if (status != FGSTATUS_OK || frameDataSize == 0)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 payload size query failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -932,6 +940,7 @@ void CameraWorker::openCamera()
         status = KYFG_StreamGetInfo(m_streamHandle, KY_STREAM_INFO_BUF_ALIGNMENT, &frameDataAligment, NULL, NULL);
         if (status != FGSTATUS_OK || frameDataAligment == 0)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 buffer alignment query failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -941,40 +950,16 @@ void CameraWorker::openCamera()
             m_pBuffers[i] = alignedAllocate(frameDataSize, frameDataAligment);
             if (!m_pBuffers[i])
             {
+                cleanupCameraLocked();
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer allocation failed at index %2").arg(m_camIndex).arg(i));
-                for (int j = 0; j < i; ++j) {
-                    if (m_pBuffers[j]) {
-                        alignedFree(m_pBuffers[j]);
-                        m_pBuffers[j] = nullptr;
-                    }
-                    m_streamBuffers[j] = 0;
-                }
-                if (m_streamHandle != INVALID_STREAMHANDLE) {
-                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
-                    KYFG_StreamDelete(m_streamHandle);
-                    m_streamHandle = INVALID_STREAMHANDLE;
-                }
                 return;
             }
 
             status = KYFG_BufferAnnounce(m_streamHandle, m_pBuffers[i], frameDataSize, NULL, &m_streamBuffers[i]);
             if (status != FGSTATUS_OK)
             {
+                cleanupCameraLocked();
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer announce failed at index %2: %3").arg(m_camIndex).arg(i).arg(status));
-                alignedFree(m_pBuffers[i]);
-                m_pBuffers[i] = nullptr;
-                for (int j = 0; j < i; ++j) {
-                    if (m_pBuffers[j]) {
-                        alignedFree(m_pBuffers[j]);
-                        m_pBuffers[j] = nullptr;
-                    }
-                    m_streamBuffers[j] = 0;
-                }
-                if (m_streamHandle != INVALID_STREAMHANDLE) {
-                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
-                    KYFG_StreamDelete(m_streamHandle);
-                    m_streamHandle = INVALID_STREAMHANDLE;
-                }
                 return;
             }
         }
@@ -994,10 +979,44 @@ void CameraWorker::openCamera()
         QTimer::singleShot(0, this, &CameraWorker::pollTemperature);
     }
     catch (const std::exception& e) {
+        cleanupCameraLocked();
         emit errorOccurred(m_camIndex, QString("Exception in openCamera: %1").arg(e.what()));
     }
     catch (...) {
+        cleanupCameraLocked();
         emit errorOccurred(m_camIndex, "Unknown exception in openCamera");
+    }
+}
+
+// ── cleanupCameraLocked ────────────────────────────────────────────────
+void CameraWorker::cleanupCameraLocked()
+{
+    // Unregister callback and delete stream cleanly
+    if (m_streamHandle != INVALID_STREAMHANDLE) {
+        const STREAM_HANDLE streamToDelete = m_streamHandle;
+        m_streamHandle = INVALID_STREAMHANDLE;
+
+        KYFG_StreamBufferCallbackUnregister(streamToDelete, streamCallback);
+        KYFG_StreamDelete(streamToDelete);
+    }
+
+    // Free buffers only after stream is completely deleted
+    for (int i = 0; i < 16; ++i) {
+        if (m_pBuffers[i]) {
+            alignedFree(m_pBuffers[i]);
+            m_pBuffers[i] = nullptr;
+        }
+        m_streamBuffers[i] = 0;
+    }
+    m_frameDataSize = 0;
+    m_actualPayloadSize = 0;
+    m_streamReopenRequired = false;
+
+    if (m_cameraOpened.exchange(false) && m_camHandle != INVALID_CAMHANDLE) {
+        const auto status = KYFG_CameraClose(m_camHandle);
+        if (status != FGSTATUS_OK) {
+            emit logMessage(QString("[Cam%1] Camera close returned %2").arg(m_camIndex).arg(status));
+        }
     }
 }
 
@@ -1014,35 +1033,7 @@ void CameraWorker::closeCamera()
 
     try {
         QMutexLocker lk(&m_mutex);
-
-        // Unregister callback and delete stream cleanly
-        if (m_streamHandle != INVALID_STREAMHANDLE) {
-            const STREAM_HANDLE streamToDelete = m_streamHandle;
-            m_streamHandle = INVALID_STREAMHANDLE;
-
-            KYFG_StreamBufferCallbackUnregister(streamToDelete, streamCallback);
-            KYFG_StreamDelete(streamToDelete);
-        }
-
-        // Free buffers only after stream is completely deleted
-        for (int i = 0; i < 16; ++i) {
-            if (m_pBuffers[i]) {
-                alignedFree(m_pBuffers[i]);
-                m_pBuffers[i] = nullptr;
-            }
-            m_streamBuffers[i] = 0;
-        }
-        m_frameDataSize = 0;
-        m_actualPayloadSize = 0;
-        m_streamReopenRequired = false;
-
-        if (m_cameraOpened.exchange(false) && m_camHandle != INVALID_CAMHANDLE) {
-            const auto status = KYFG_CameraClose(m_camHandle);
-            if (status != FGSTATUS_OK) {
-                emit logMessage(QString("[Cam%1] Camera close returned %2").arg(m_camIndex).arg(status));
-            }
-        }
-
+        cleanupCameraLocked();
         emit cameraClosed(m_camIndex);
     }
     catch (const std::exception& e) {

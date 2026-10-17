@@ -2,8 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DEFAULT_VER="1.0.0"
+if [[ -f "$ROOT/AppVersion.h" ]]; then
+    EXTRACTED_VER="$(grep -E '^#define[[:space:]]+APP_VERSION[[:space:]]+' "$ROOT/AppVersion.h" | sed -E 's/.*"([^"]+)".*/\1/')"
+    if [[ -n "$EXTRACTED_VER" ]]; then
+        DEFAULT_VER="$EXTRACTED_VER"
+    fi
+fi
 
-VERSION="${1:-1.4.1}"
+VERSION="${1:-$DEFAULT_VER}"
 ARCH="$(dpkg --print-architecture)"
 MAINTAINER="${DEB_MAINTAINER:-TVNT04 <tvnt04@users.noreply.github.com>}"
 

@@ -16,6 +16,20 @@ CameraManager::~CameraManager()
 
 void CameraManager::initialize()
 {
+    if (!m_hardwareThread)
+    {
+        m_hardwareThread = new QThread(this);
+        m_hardwareWorker = new HardwareWorker();
+        m_hardwareWorker->moveToThread(m_hardwareThread);
+
+        connect(m_hardwareWorker, &HardwareWorker::hardwareDetected,
+                this, &CameraManager::onHardwareDetected, Qt::QueuedConnection);
+        connect(m_hardwareWorker, &HardwareWorker::statusMessage,
+                this, &CameraManager::statusMessage, Qt::QueuedConnection);
+
+        m_hardwareThread->start();
+    }
+
     for (int i = 0; i < 2; ++i)
     {
         if (m_workerThreads[i]) continue;
@@ -61,6 +75,26 @@ void CameraManager::shutdown()
         m_streaming[i] = false;
     }
 
+    if (m_hardwareWorker)
+    {
+        QMetaObject::invokeMethod(m_hardwareWorker, "doCloseHardware", Qt::BlockingQueuedConnection);
+    }
+    if (m_hardwareThread)
+    {
+        m_hardwareThread->quit();
+        m_hardwareThread->wait();
+        delete m_hardwareWorker;
+        m_hardwareWorker = nullptr;
+        m_hardwareThread = nullptr;
+    }
+
+#if !USING_STUB
+    m_fgHandles.clear();
+#endif
+}
+
+void HardwareWorker::doCloseHardware()
+{
 #if !USING_STUB
     std::set<FGHANDLE> closedFgs;
     for (FGHANDLE fg : m_fgHandles)
@@ -75,17 +109,11 @@ void CameraManager::shutdown()
 #endif
 }
 
-void CameraManager::detectHardware()
+void HardwareWorker::doDetectHardware()
 {
     emit statusMessage("Detecting KAYA frame grabbers & CoaXPress cameras...", 3000);
 
 #if !USING_STUB
-    if (m_streaming[0] || m_streaming[1] || m_connected[0] || m_connected[1])
-    {
-        emit statusMessage("Stop and disconnect cameras before running detection again.", 5000);
-        return;
-    }
-
     KYFGLib_InitParameters kyInit{};
     kyInit.version = 2;
     kyInit.concurrency_mode = 0;
@@ -95,25 +123,22 @@ void CameraManager::detectHardware()
     if (FGSTATUS_OK != KYFGLib_Initialize(&kyInit))
     {
         emit statusMessage("Failed to initialize KYFGLib", 5000);
+        m_detectedCameraCount = 0;
+        m_detectedCameraNames.clear();
+        emit hardwareDetected(0, {});
         return;
     }
 
-    std::set<FGHANDLE> closedFgs;
-    for (FGHANDLE fg : m_fgHandles)
-    {
-        if (fg != INVALID_FGHANDLE && closedFgs.find(fg) == closedFgs.end())
-        {
-            closedFgs.insert(fg);
-            try { KYFG_Close(fg); } catch (...) {}
-        }
-    }
-    m_fgHandles.clear();
+    doCloseHardware();
 
     int nKayaDevicesCount = 0;
     KY_DeviceScan(&nKayaDevicesCount);
     if (nKayaDevicesCount == 0)
     {
         emit statusMessage("No KAYA devices found", 5000);
+        m_detectedCameraCount = 0;
+        m_detectedCameraNames.clear();
+        emit hardwareDetected(0, {});
         return;
     }
 
@@ -125,6 +150,9 @@ void CameraManager::detectHardware()
         {
             emit statusMessage(QString("Failed to get info for device %1").arg(i), 5000);
             free(grabbersInfoArray);
+            m_detectedCameraCount = 0;
+            m_detectedCameraNames.clear();
+            emit hardwareDetected(0, {});
             return;
         }
     }
@@ -209,6 +237,49 @@ void CameraManager::detectHardware()
     emit hardwareDetected(m_detectedCameraCount, m_detectedCameraNames);
     emit statusMessage("Stub mode: 1 camera detected.", 3000);
 #endif
+}
+
+void CameraManager::detectHardware()
+{
+    if (m_streaming[0] || m_streaming[1] || m_connected[0] || m_connected[1])
+    {
+        emit statusMessage("Stop and disconnect cameras before running detection again.", 5000);
+        emit hardwareDetected(m_detectedCameraCount, m_detectedCameraNames);
+        return;
+    }
+
+    if (m_hardwareWorker)
+    {
+        QMetaObject::invokeMethod(m_hardwareWorker, "doDetectHardware", Qt::QueuedConnection);
+    }
+    else
+    {
+        emit hardwareDetected(0, {});
+    }
+}
+
+void CameraManager::onHardwareDetected(int count, const QStringList& names)
+{
+    m_detectedCameraCount = count;
+    m_detectedCameraNames = names;
+#if !USING_STUB
+    if (m_hardwareWorker)
+    {
+        m_fgHandles = m_hardwareWorker->fgHandles();
+        for (int i = 0; i < count && i < KY_MAX_CAMERAS; ++i)
+        {
+            m_detectedCamHandles[i] = m_hardwareWorker->detectedCamHandle(i);
+            m_detectedCamFgs[i]     = m_hardwareWorker->detectedCamFg(i);
+        }
+    }
+#endif
+
+    for (int i = 0; i < m_detectedCameraCount && i < 2; ++i)
+    {
+        assignCameraSource(i, i);
+    }
+
+    emit hardwareDetected(m_detectedCameraCount, m_detectedCameraNames);
 }
 
 void CameraManager::assignCameraSource(int slot, int detectedIndex)

@@ -7,7 +7,16 @@
 #   ./build_xdt.sh 1.4.2 --install
 set -Eeuo pipefail
 
-VERSION="1.4.1"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_VER="1.0.0"
+if [[ -f "$ROOT/AppVersion.h" ]]; then
+    EXTRACTED_VER="$(grep -E '^#define[[:space:]]+APP_VERSION[[:space:]]+' "$ROOT/AppVersion.h" | sed -E 's/.*"([^"]+)".*/\1/')"
+    if [[ -n "$EXTRACTED_VER" ]]; then
+        DEFAULT_VER="$EXTRACTED_VER"
+    fi
+fi
+
+VERSION=""
 DO_INSTALL=0
 
 for arg in "$@"; do
@@ -27,7 +36,10 @@ for arg in "$@"; do
     esac
 done
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "$VERSION" ]]; then
+    VERSION="$DEFAULT_VER"
+fi
+
 BUILD_DIR="$ROOT/build"
 ARCH="$(dpkg --print-architecture)"
 BUNDLE_DIR="$BUILD_DIR/portable/XDT-${VERSION}-linux-$(uname -m)"
@@ -47,13 +59,15 @@ command -v nproc >/dev/null 2>&1 || true
 JOBS=2
 if command -v nproc >/dev/null 2>&1; then JOBS="$(nproc)"; fi
 
-step "Configure XDT ($VERSION, Release)"
+step "Configure XDT ($VERSION, Release, Real Hardware)"
 cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DUSING_STUB=OFF \
     -DPORTABLE_LINUX_BUNDLE=ON
 
 step "Compile XDT and build the portable runtime bundle"
 cmake --build "$BUILD_DIR" --target portable_linux_bundle --parallel "$JOBS"
+cp -f "$BUILD_DIR/xdt" "$ROOT/xdt"
 
 [[ -x "$BUNDLE_DIR/xdt" ]] || die "Portable executable missing: $BUNDLE_DIR/xdt"
 [[ -x "$BUNDLE_DIR/AppRun" ]] || die "Portable launcher missing: $BUNDLE_DIR/AppRun"

@@ -164,6 +164,7 @@ private:
     bool applyCameraParameters(bool includeGeometry);
     CameraParams queryCameraParameters();
     size_t queryActualPayloadSize() const;
+    void cleanupCameraLocked();
 
     // ── Real hardware members ──────────────────────────────────────────
     STREAM_HANDLE       m_streamHandle = INVALID_STREAMHANDLE;
