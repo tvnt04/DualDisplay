@@ -2,6 +2,7 @@
 #include "KYFGLibA.h"
 #endif
 #include <QApplication>
+#include "AppVersion.h"
 #include "MainWindow.h"
 #include <memory>
 
@@ -15,7 +16,8 @@ int main(int argc, char* argv[])
     qRegisterMetaType<size_t>("size_t");
     qRegisterMetaType<CameraParams>("CameraParams");
     qRegisterMetaType<quint64>("quint64");
-    app.setApplicationName("DualDisplay");
+    app.setApplicationName(APP_NAME);
+    app.setApplicationVersion(APP_VERSION);
     app.setOrganizationName("DualDisplay");
     MainWindow win;
     win.showMaximized();

@@ -78,7 +78,6 @@ void CameraManager::shutdown()
 void CameraManager::detectHardware()
 {
     emit statusMessage("Detecting KAYA frame grabbers & CoaXPress cameras...", 3000);
-    QCoreApplication::processEvents();
 
 #if !USING_STUB
     if (m_streaming[0] || m_streaming[1] || m_connected[0] || m_connected[1])
@@ -243,6 +242,16 @@ void CameraManager::assignCameraSource(int slot, int detectedIndex)
 #endif
 }
 
+CAMHANDLE CameraManager::camHandle(int idx) const
+{
+    if (idx < 0 || idx > 1) return INVALID_CAMHANDLE;
+#if !USING_STUB
+    return m_camHandles[idx];
+#else
+    return (CAMHANDLE)idx;
+#endif
+}
+
 bool CameraManager::isConnected(int idx) const
 {
     if (idx < 0 || idx > 1) return false;
@@ -280,6 +289,24 @@ void CameraManager::stopStream(int idx)
 {
     if (idx < 0 || idx > 1 || !m_workers[idx]) return;
     QMetaObject::invokeMethod(m_workers[idx], "stopStream", Qt::QueuedConnection);
+}
+
+void CameraManager::startAllStreams()
+{
+    for (int i = 0; i < 2; ++i) {
+        if (m_connected[i] && !m_streaming[i] && m_workers[i]) {
+            QMetaObject::invokeMethod(m_workers[i], "startStream", Qt::QueuedConnection);
+        }
+    }
+}
+
+void CameraManager::stopAllStreams()
+{
+    for (int i = 0; i < 2; ++i) {
+        if (m_streaming[i] && m_workers[i]) {
+            QMetaObject::invokeMethod(m_workers[i], "stopStream", Qt::QueuedConnection);
+        }
+    }
 }
 
 void CameraManager::applyWorkerParams(int idx, const CameraParams& params)

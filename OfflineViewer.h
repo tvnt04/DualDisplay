@@ -132,6 +132,7 @@ private:
     QWidget*      m_offlineFlatControlsWidget = nullptr;
     QFrame*       m_offlineDiv1 = nullptr;
     QSplitter*    m_viewGraphSplitter = nullptr;   // vertical splitter: image ↔ graphs
+    QSplitter*    m_offlineRootSplitter = nullptr; // vertical splitter: host ↔ terminal
 
     // Cache for last rendered frame
     QByteArray    m_lastFramePixels[2];
@@ -142,4 +143,16 @@ private:
     bool          m_isDraggingROI = false;
     QPoint        m_dragStartPos;
     int           m_activeDragIdx = -1;
+
+    // Display controls (zoom, fit, actual size, pixel contrast)
+    QPushButton*  m_offlineFitBtn = nullptr;
+    QPushButton*  m_offlineActualBtn = nullptr;
+    QPushButton*  m_offlineZoomOutBtn = nullptr;
+    QLabel*       m_offlineZoomLabel = nullptr;
+    QPushButton*  m_offlineZoomInBtn = nullptr;
+    QPushButton*  m_offlineContrastBtn = nullptr;
+    double        m_zoomFactor = 1.0;
+    bool          m_fitToScreen = true;
+    bool          m_pixelContrast = false;
+    std::vector<uint8_t> m_contrastBuffer[2];
 };

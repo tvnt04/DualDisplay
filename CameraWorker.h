@@ -45,6 +45,7 @@ struct FramePacket {
     int   cameraIndex    = 0;
     int   packedMin      = 0;
     int   packedMax      = 0;
+    double instantFps    = 0.0;
     qint64 timestampMs   = 0;
 };
 

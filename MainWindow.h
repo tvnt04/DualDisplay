@@ -7,6 +7,7 @@
 #include <QAbstractButton>
 #include <QPushButton>
 #include <QDoubleSpinBox>
+#include <QSlider>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QScrollArea>
@@ -22,6 +23,9 @@
 #include <cstdio>
 #include <QSettings>
 #include <QSpinBox>
+#include <QAction>
+#include <QMenu>
+#include "ThemeToggleSwitch.h"
 
 class QFile;
 #include <cstring>
@@ -52,6 +56,8 @@ public:
 protected:
     void closeEvent(QCloseEvent* e) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 private slots:
     void onConnectClicked (int idx);
     void onStartClicked   (int idx);
@@ -77,6 +83,7 @@ private slots:
     void onMergeSaveClicked   ();
     void onMergeSaverStats    (quint64 savedCount, quint64 droppedCount, quint64 queueDepth);
     void onToggleControlsClicked();
+    void onToggleLogClicked();
     void onPixelStretchToggled(bool checked);
     void applyPresetSideBySide  ();
     void applyPresetTopBottom   ();
@@ -121,8 +128,13 @@ private:
                                    bool reverseX, bool reverseY,
                                    bool stopAfterEnabled, const QString& saveDuration);
     void updateTdiUiVisibility(int idx);
+    void updateSidebarLabels(int panelWidth);
+    double sliderIndexToDuration(int sliderVal, int camIdx) const;
+    int durationToSliderIndex(double dur, int camIdx);
     QString getPreferencesFilePath() const;
     void appendLogLine(const QString& line);
+    void updateCollapseButtonPosition();
+    void updateLogButtonPosition();
     enum class PresetLayout {
         SideBySide,
         TopBottom,
@@ -154,7 +166,9 @@ private:
     float         m_lastSensorTemp[2] = {-999.0f, -999.0f};
     float         m_lastGrabberTemp[2] = {-999.0f, -999.0f};
     QScrollArea*  m_sidebarScroll = nullptr;
-    QComboBox*    m_layoutCombo = nullptr;
+    QPushButton*  m_layoutBtn = nullptr;
+    QAction*      m_layoutActions[4] = {};
+    void          updateLayoutMenuCheckmark(PresetLayout preset);
     void resetAllValuesToDefault();
     QWidget*      m_sidebarContent = nullptr;
     QVBoxLayout*  m_sidebarLayout = nullptr;
@@ -163,8 +177,20 @@ private:
     QLineEdit*    m_sidebarRawEdits[2] = {};
     QLineEdit*    m_sidebarSavePathEdits[2] = {};
     QComboBox*    m_sidebarSaveModeCombos[2] = {};
-    QLineEdit*    m_sidebarSaveDurationEdits[2] = {};
-    QCheckBox*    m_sidebarStopAfterDurationChecks[2] = {};
+    QSlider*        m_sidebarDurationSliders[2] = {};
+    QDoubleSpinBox* m_sidebarDurationSpins[2] = {};
+    double          m_customLastDuration[2] = {20.0, 20.0};
+    QLabel*       m_sidebarWidthLabels[2] = {};
+    QLabel*       m_sidebarHeightLabels[2] = {};
+    QLabel*       m_sidebarFpsLabels[2] = {};
+    QLabel*       m_sidebarExposureLabels[2] = {};
+    QLabel*       m_sidebarGainLabels[2] = {};
+    QLabel*       m_sidebarTestPatternLabels[2] = {};
+    QLabel*       m_sidebarTdiStagesLabels[2] = {};
+    QLabel*       m_sidebarTdiYShiftLabels[2] = {};
+    QLabel*       m_sidebarTdiFrameCountLabels[2] = {};
+    QLabel*       m_sidebarSaveModeLabels[2] = {};
+    bool          m_sidebarExpanded = false;
     QLineEdit*    m_sidebarWidthEdits[2] = {};
     QLineEdit*    m_sidebarHeightEdits[2] = {};
     QLineEdit*    m_sidebarFpsEdits[2] = {};
@@ -194,8 +220,8 @@ private:
     QLineEdit*    m_topRawEdits[2] = {};
     QLineEdit*    m_topSavePathEdits[2] = {};
     QComboBox*    m_topSaveModeCombos[2] = {};
-    QLineEdit*    m_topSaveDurationEdits[2] = {};
-    QCheckBox*    m_topStopAfterDurationChecks[2] = {};
+    QSlider*        m_topDurationSliders[2] = {};
+    QDoubleSpinBox* m_topDurationSpins[2] = {};
     QLineEdit*    m_topWidthEdits[2] = {};
     QLineEdit*    m_topHeightEdits[2] = {};
     QLineEdit*    m_topFpsEdits[2] = {};
@@ -231,13 +257,18 @@ private:
     QTabWidget*   m_viewTabs = nullptr;
     DetachedView* m_detachedView = nullptr;
     QAbstractButton* m_displayModeBtn = nullptr;
-    QAbstractButton* m_darkModeBtn = nullptr;
+    ThemeToggleSwitch* m_darkModeBtn = nullptr;
+    QFrame*         m_appCap = nullptr;
+    QPushButton*    m_appNameBtn = nullptr;
     QPushButton*    m_detectBtn = nullptr;
     QPushButton*    m_connectAllBtn = nullptr;
     QPushButton*    m_startAllBtn = nullptr;
     QPushButton*    m_saveAllBtn = nullptr;
     QPushButton*    m_saveModeToggleBtn = nullptr;
-    QPushButton*    m_toggleControlsBtn = nullptr;
+    QPushButton*    m_collapseBtn = nullptr;
+    QWidget*        m_sidebarContainer = nullptr;
+    QWidget*        m_liveTab = nullptr;
+    int             m_lastControlsWidth = 410;
     QComboBox*      m_lineDelaySpin = nullptr;
     QDoubleSpinBox* m_timeDelaySpin = nullptr;
     QComboBox*      m_calibModeCombo = nullptr;
@@ -246,6 +277,10 @@ private:
     QPushButton*    m_markCam1Btn = nullptr;
     QPushButton*    m_markCam2Btn = nullptr;
     QPushButton*    m_floatCam1Btn = nullptr;
+    QWidget*        m_logContainer = nullptr;
+    QPushButton*    m_logCollapseBtn = nullptr;
+    bool            m_logHidden = false;
+    int             m_lastLogHeight = 96;
 
     bool        m_connected [2] = {};
     bool        m_streaming [2] = {};
@@ -261,6 +296,8 @@ private:
     bool        m_darkMode = false;
     bool        m_fitToScreen  = true;
     bool        m_pixelStretch = false;
+    std::vector<uint8_t> m_pixelStretchBuf[2];
+    std::vector<uint8_t> m_previewBuf[2];
     double      m_zoomFactors[2] = {1.0, 1.0};
 
 signals:

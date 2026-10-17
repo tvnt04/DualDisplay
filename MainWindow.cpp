@@ -1,5 +1,7 @@
 #include "MainWindow.h"
+#include "AppVersion.h"
 #include "NativeFile.h"
+#include "VideoViewLabel.h"
 
 #ifdef HAS_OFFLINE_VIEWER
 #include "OfflineViewer.h"
@@ -9,6 +11,7 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QCloseEvent>
+#include <QResizeEvent>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -29,12 +32,139 @@
 #include <QTabBar>
 #include <QPainter>
 #include <QScrollBar>
-#include <QSignalBlocker>
+#include <QDialog>
+#include <QProgressBar>
 #include <QRegularExpression>
 #include <algorithm>
 #include <set>
 
 namespace {
+class RotatingSpinner : public QWidget
+{
+public:
+    explicit RotatingSpinner(QWidget* parent = nullptr, bool darkMode = true)
+        : QWidget(parent)
+        , m_darkMode(darkMode)
+    {
+        setFixedSize(38, 38);
+        connect(&m_timer, &QTimer::timeout, this, [this]() {
+            m_angle = (m_angle + 7) % 360;
+            update();
+        });
+        m_timer.start(16); // 60 FPS smooth animation
+    }
+
+    void setColors(const QColor& track, const QColor& accent) {
+        m_trackColor = track;
+        m_accentColor = accent;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        const qreal penW = 3.5;
+        const qreal margin = penW / 2.0 + 1.0;
+        const QRectF r(margin, margin, width() - 2 * margin, height() - 2 * margin);
+
+        // Subtle background circle track
+        QPen trackPen(m_trackColor, penW);
+        trackPen.setCapStyle(Qt::RoundCap);
+        p.setPen(trackPen);
+        p.drawEllipse(r);
+
+        // Animated rotating circular arc
+        QPen arcPen(m_accentColor, penW);
+        arcPen.setCapStyle(Qt::RoundCap);
+        p.setPen(arcPen);
+        p.drawArc(r, -m_angle * 16, -100 * 16);
+    }
+
+private:
+    bool m_darkMode = true;
+    int m_angle = 0;
+    QTimer m_timer;
+    QColor m_trackColor = QColor(255, 255, 255, 30);
+    QColor m_accentColor = QColor("#3b82f6");
+};
+
+class DetectionProgressDialog : public QDialog {
+public:
+    explicit DetectionProgressDialog(QWidget* parent = nullptr, bool darkMode = true)
+        : QDialog(parent, Qt::Dialog | Qt::CustomizeWindowHint | Qt::WindowTitleHint)
+        , m_darkMode(darkMode)
+    {
+        setWindowModality(Qt::ApplicationModal);
+        setWindowTitle("Hardware Detection");
+        setFixedSize(390, 115);
+
+        const QString bg = m_darkMode ? "#18181b" : "#ffffff";
+        const QString textCol = m_darkMode ? "#f4f4f5" : "#18181b";
+        const QString subTextCol = m_darkMode ? "#a1a1aa" : "#718096";
+        const QString borderCol = m_darkMode ? "#3f3f46" : "#cbd5e1";
+
+        setStyleSheet(QString(
+            "QDialog { background-color: %1; border: 1px solid %2; border-radius: 10px; }"
+            "QLabel { background: transparent; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }"
+        ).arg(bg, borderCol));
+
+        QHBoxLayout* rootLayout = new QHBoxLayout(this);
+        rootLayout->setContentsMargins(20, 16, 20, 16);
+        rootLayout->setSpacing(16);
+
+        m_spinner = new RotatingSpinner(this, m_darkMode);
+        if (m_darkMode) {
+            m_spinner->setColors(QColor(255, 255, 255, 35), QColor("#3b82f6"));
+        } else {
+            m_spinner->setColors(QColor(0, 0, 0, 25), QColor("#2563eb"));
+        }
+        rootLayout->addWidget(m_spinner, 0, Qt::AlignCenter);
+
+        QVBoxLayout* textLayout = new QVBoxLayout();
+        textLayout->setSpacing(4);
+        textLayout->setContentsMargins(0, 0, 0, 0);
+
+        QLabel* titleLabel = new QLabel("Detecting Cameras...", this);
+        titleLabel->setStyleSheet(QString("font-size: 14px; font-weight: bold; color: %1;").arg(textCol));
+        textLayout->addWidget(titleLabel);
+
+        QLabel* descLabel = new QLabel("Scanning KAYA frame grabbers and CoaXPress devices.\nPlease wait...", this);
+        descLabel->setStyleSheet(QString("font-size: 11px; color: %1; line-height: 1.3;").arg(subTextCol));
+        textLayout->addWidget(descLabel);
+
+        rootLayout->addLayout(textLayout, 1);
+    }
+
+    void allowClose() {
+        m_canClose = true;
+        accept();
+    }
+
+protected:
+    void keyPressEvent(QKeyEvent* e) override {
+        if (e->key() == Qt::Key_Escape) {
+            e->ignore();
+            return;
+        }
+        QDialog::keyPressEvent(e);
+    }
+
+    void closeEvent(QCloseEvent* e) override {
+        if (!m_canClose) {
+            e->ignore();
+            return;
+        }
+        QDialog::closeEvent(e);
+    }
+
+private:
+    bool m_darkMode = true;
+    bool m_canClose = false;
+    RotatingSpinner* m_spinner = nullptr;
+};
+
 class DisplayModeSwitch final : public QAbstractButton
 {
 public:
@@ -95,7 +225,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     setProperty("fitToScreen", m_fitToScreen);
     setProperty("pixelStretch", m_pixelStretch);
 
-    setWindowTitle("DualDisplay — Dual Camera Live View");
+    setWindowTitle(APP_TITLE_STRING);
+    setWindowIcon(QIcon(":/resources/icons/app-icon.png"));
     resize(1920, 1080);
     buildUI();
 
@@ -123,32 +254,31 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
         applyCameraUiStateToWidgets(camIdx);
     }, Qt::QueuedConnection);
     connect(m_cameraManager, &CameraManager::hardwareDetected, this, [this](int count, const QStringList& names) {
-        Q_UNUSED(count);
         for (int slot = 0; slot < 2; ++slot) {
-            auto populateSourceCombo = [slot, &names](QComboBox* cb) {
+            auto populateSourceCombo = [slot, count, &names](QComboBox* cb) {
                 if (!cb) return;
-                const int currentIdx = cb->currentIndex();
                 cb->blockSignals(true);
                 cb->clear();
-                for (int i = 0; i < names.size(); ++i) {
-                    cb->addItem(names[i]);
+                cb->addItem("No source", -1);
+                for (int i = 0; i < count; ++i) {
+                    cb->addItem(names.value(i, QString("[%1] Camera").arg(i)), i);
                 }
-                if (names.isEmpty()) {
-                    cb->addItem("No cameras found");
-                }
-                int targetIndex = (currentIdx >= 0 && currentIdx < cb->count()) ? currentIdx : slot;
-                if (targetIndex >= cb->count()) targetIndex = 0;
-                cb->setCurrentIndex(targetIndex);
+                const int defaultDetectedIndex = (slot < count) ? slot : -1;
+                const int comboIndex = defaultDetectedIndex >= 0
+                    ? cb->findData(defaultDetectedIndex)
+                    : 0;
+                cb->setCurrentIndex(comboIndex >= 0 ? comboIndex : 0);
+                cb->setEnabled(true);
                 cb->blockSignals(false);
             };
             populateSourceCombo(m_sidebarSourceCombos[slot]);
             populateSourceCombo(m_topSourceCombos[slot]);
             applyCameraSourceSelection(slot);
         }
-    });
+    }, Qt::QueuedConnection);
     connect(m_cameraManager, &CameraManager::statusMessage, this, [this](const QString& msg, int timeoutMs) {
         if (statusBar()) statusBar()->showMessage(msg, timeoutMs);
-    });
+    }, Qt::QueuedConnection);
 
     m_cameraManager->initialize();
 
@@ -215,9 +345,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
     loadSettings();
     if (m_darkModeBtn) {
-        m_darkModeBtn->setChecked(m_darkMode);
+        m_darkModeBtn->setDarkMode(m_darkMode, false);
     }
     applyStyles();
+    if (m_sidebarScroll) {
+        updateSidebarLabels(m_sidebarScroll->width());
+    }
 
     m_lastAppliedRegionOffset[0] = getActiveRegionOffset(0);
     m_lastAppliedRegionOffset[1] = getActiveRegionOffset(1);
@@ -261,33 +394,67 @@ void MainWindow::buildUI()
     centerLayout->setSpacing(0);
     m_rootSplitter = new QSplitter(Qt::Vertical, center);
     m_rootSplitter->setChildrenCollapsible(false);
+    m_rootSplitter->setHandleWidth(2);
 
     m_mainSplitter = new QSplitter(Qt::Horizontal, m_rootSplitter);
     m_mainSplitter->setChildrenCollapsible(false);
-    m_logTerminal = new QPlainTextEdit(m_rootSplitter);
+    m_mainSplitter->setHandleWidth(2);
+    m_logContainer = new QWidget(m_rootSplitter);
+    m_logContainer->setObjectName("logContainer");
+    QVBoxLayout* logContainerLay = new QVBoxLayout(m_logContainer);
+    logContainerLay->setContentsMargins(0, 0, 0, 0);
+    logContainerLay->setSpacing(0);
+
+    m_logTerminal = new QPlainTextEdit(m_logContainer);
     m_logTerminal->setObjectName("logTerminal");
     m_logTerminal->setReadOnly(true);
     m_logTerminal->setMaximumBlockCount(2000);
     m_logTerminal->setPlaceholderText("Runtime logs...");
-    m_logTerminal->setMinimumHeight(72);
-    m_logTerminal->setMaximumHeight(96);
+    m_logTerminal->setMinimumHeight(30);
+
+    logContainerLay->addWidget(m_logTerminal, 1);
 
     m_rootSplitter->addWidget(m_mainSplitter);
-    m_rootSplitter->addWidget(m_logTerminal);
+    m_rootSplitter->addWidget(m_logContainer);
     m_rootSplitter->setStretchFactor(0, 1);
     m_rootSplitter->setStretchFactor(1, 0);
     m_rootSplitter->setSizes({984, 96});
+    connect(m_rootSplitter, &QSplitter::splitterMoved, this, [this](int, int){
+        if (!m_logHidden && m_logContainer && m_logContainer->height() > 30) {
+            m_lastLogHeight = m_logContainer->height();
+        }
+        updateLogButtonPosition();
+    });
 
     m_mainTabs = new QTabWidget(center);
     m_mainTabs->tabBar()->setElideMode(Qt::ElideNone);
     m_mainTabs->tabBar()->setExpanding(false);
-    QWidget* liveTab = new QWidget();
-    QVBoxLayout* liveTabLayout = new QVBoxLayout(liveTab);
+    m_liveTab = new QWidget();
+    QVBoxLayout* liveTabLayout = new QVBoxLayout(m_liveTab);
     liveTabLayout->setContentsMargins(0, 0, 0, 0);
     liveTabLayout->setSpacing(0);
     liveTabLayout->addWidget(m_rootSplitter);
 
-    m_mainTabs->addTab(liveTab, "Live Capture");
+    m_mainTabs->addTab(m_liveTab, "Live Capture");
+
+    m_collapseBtn = new QPushButton("◀", m_liveTab);
+    m_collapseBtn->setObjectName("collapseBtn");
+    m_collapseBtn->setFixedSize(16, 52);
+    m_collapseBtn->setCursor(Qt::PointingHandCursor);
+    m_collapseBtn->setToolTip("Hide controls");
+    connect(m_collapseBtn, &QPushButton::clicked, this, &MainWindow::onToggleControlsClicked);
+
+    m_logCollapseBtn = new QPushButton(QString::fromUtf8("▼"), m_liveTab);
+    m_logCollapseBtn->setObjectName("logCollapseBtn");
+    m_logCollapseBtn->setFixedSize(52, 16);
+    m_logCollapseBtn->setCursor(Qt::PointingHandCursor);
+    m_logCollapseBtn->setToolTip("Hide Terminal (▼)");
+    connect(m_logCollapseBtn, &QPushButton::clicked, this, &MainWindow::onToggleLogClicked);
+
+    connect(m_mainTabs, &QTabWidget::currentChanged, this, [this](int){
+        updateCollapseButtonPosition();
+        updateLogButtonPosition();
+    });
 
 #ifdef HAS_OFFLINE_VIEWER
     m_offlineViewer = new OfflineViewer(this);
@@ -303,19 +470,33 @@ void MainWindow::buildUI()
             appendLogLine(msg);
     });
 
-    m_sidebarScroll = new QScrollArea(center);
+    m_sidebarContainer = new QWidget(center);
+    m_sidebarContainer->setObjectName("sidebarContainer");
+    QHBoxLayout* sidebarContainerLay = new QHBoxLayout(m_sidebarContainer);
+    sidebarContainerLay->setContentsMargins(0, 0, 0, 0);
+    sidebarContainerLay->setSpacing(0);
+
+    m_sidebarScroll = new QScrollArea(m_sidebarContainer);
     m_sidebarScroll->setObjectName("sidebarScroll");
     m_sidebarScroll->setWidgetResizable(true);
     m_sidebarScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_sidebarScroll->setFrameShape(QFrame::NoFrame);
-    m_sidebarScroll->setMinimumWidth(260);
+    m_sidebarScroll->setMinimumWidth(380);
+    m_sidebarScroll->installEventFilter(this);
     m_sidebarContent = new QWidget();
     m_sidebarContent->setObjectName("sidebarContent");
     m_sidebarLayout = new QVBoxLayout(m_sidebarContent);
     m_sidebarLayout->setContentsMargins(8, 8, 8, 8);
     m_sidebarLayout->setSpacing(8);
     m_sidebarScroll->setWidget(m_sidebarContent);
-    m_mainSplitter->addWidget(m_sidebarScroll);
+    sidebarContainerLay->addWidget(m_sidebarScroll, 1);
+
+    m_mainSplitter->addWidget(m_sidebarContainer);
+    m_liveTab->installEventFilter(this);
+    m_mainSplitter->installEventFilter(this);
+    m_sidebarContainer->installEventFilter(this);
+    m_rootSplitter->installEventFilter(this);
+    m_logContainer->installEventFilter(this);
 
     m_operatorPanel = new QWidget(m_sidebarContent);
     m_operatorPanel->setObjectName("operatorPanel");
@@ -382,26 +563,28 @@ void MainWindow::buildUI()
         QGridLayout* compactForm = new QGridLayout();
         compactForm->setHorizontalSpacing(4);
         compactForm->setVerticalSpacing(4);
-        auto makeCompactField = [&](const QString& labelText, QLineEdit** target) {
+        auto makeCompactField = [&](const QString& labelText, QLineEdit** target, QLabel** labelTarget = nullptr) {
             QWidget* wrap = new QWidget(card);
             QHBoxLayout* wrapLayout = new QHBoxLayout(wrap);
             wrapLayout->setContentsMargins(0, 0, 0, 0);
             wrapLayout->setSpacing(3);
             QLabel* label = new QLabel(labelText, wrap);
             label->setObjectName("compactLabel");
+            if (labelTarget) *labelTarget = label;
             *target = new QLineEdit(wrap);
             (*target)->setObjectName("compactEdit");
             wrapLayout->addWidget(label);
             wrapLayout->addWidget(*target, 1);
             return wrap;
         };
-        auto makeCompactCombo = [&](const QString& labelText, QComboBox** target, const QStringList& items) {
+        auto makeCompactCombo = [&](const QString& labelText, QComboBox** target, const QStringList& items, QLabel** labelTarget = nullptr) {
             QWidget* wrap = new QWidget(card);
             QHBoxLayout* wrapLayout = new QHBoxLayout(wrap);
             wrapLayout->setContentsMargins(0, 0, 0, 0);
             wrapLayout->setSpacing(3);
             QLabel* label = new QLabel(labelText, wrap);
             label->setObjectName("compactLabel");
+            if (labelTarget) *labelTarget = label;
             *target = new QComboBox(wrap);
             (*target)->setObjectName("compactCombo");
             (*target)->addItems(items);
@@ -409,12 +592,12 @@ void MainWindow::buildUI()
             wrapLayout->addWidget(*target, 1);
             return wrap;
         };
-        compactForm->addWidget(makeCompactField("W", &m_sidebarWidthEdits[i]), 0, 0);
-        compactForm->addWidget(makeCompactField("H", &m_sidebarHeightEdits[i]), 0, 1);
-        compactForm->addWidget(makeCompactField("FPS", &m_sidebarFpsEdits[i]), 1, 0);
-        compactForm->addWidget(makeCompactCombo("Test", &m_sidebarTestPatternCombos[i], {"Off", "Gray Diagonal Ramp"}), 1, 1);
-        compactForm->addWidget(makeCompactField("Exp", &m_sidebarExposureEdits[i]), 2, 0);
-        compactForm->addWidget(makeCompactField("Gain", &m_sidebarGainEdits[i]), 2, 1);
+        compactForm->addWidget(makeCompactField("W", &m_sidebarWidthEdits[i], &m_sidebarWidthLabels[i]), 0, 0);
+        compactForm->addWidget(makeCompactField("H", &m_sidebarHeightEdits[i], &m_sidebarHeightLabels[i]), 0, 1);
+        compactForm->addWidget(makeCompactField("FPS", &m_sidebarFpsEdits[i], &m_sidebarFpsLabels[i]), 1, 0);
+        compactForm->addWidget(makeCompactCombo("Test", &m_sidebarTestPatternCombos[i], {"Off", "Gray Diagonal Ramp"}, &m_sidebarTestPatternLabels[i]), 1, 1);
+        compactForm->addWidget(makeCompactField("Exp", &m_sidebarExposureEdits[i], &m_sidebarExposureLabels[i]), 2, 0);
+        compactForm->addWidget(makeCompactField("Gain", &m_sidebarGainEdits[i], &m_sidebarGainLabels[i]), 2, 1);
         cardLayout->addLayout(compactForm);
 
         m_sidebarWidthEdits[i]->setValidator(new QIntValidator(1024, 9344, this));
@@ -456,6 +639,7 @@ void MainWindow::buildUI()
         stgLayout->setSpacing(2);
         QLabel* stgLbl = new QLabel("Stg", stgGroup);
         stgLbl->setObjectName("compactLabel");
+        m_sidebarTdiStagesLabels[i] = stgLbl;
         m_sidebarTdiStagesEdits[i] = new QLineEdit(stgGroup);
         m_sidebarTdiStagesEdits[i]->setObjectName("compactEdit");
         m_sidebarTdiStagesEdits[i]->setValidator(new QIntValidator(1, 32, this));
@@ -471,6 +655,7 @@ void MainWindow::buildUI()
         yShiftLayout->setSpacing(2);
         QLabel* yShiftLbl = new QLabel("Y-Shift", yShiftGroup);
         yShiftLbl->setObjectName("compactLabel");
+        m_sidebarTdiYShiftLabels[i] = yShiftLbl;
         m_sidebarTdiYShiftEdits[i] = new QLineEdit(yShiftGroup);
         m_sidebarTdiYShiftEdits[i]->setObjectName("compactEdit");
         m_sidebarTdiYShiftEdits[i]->setValidator(new QIntValidator(0, 4096, this));
@@ -486,6 +671,7 @@ void MainWindow::buildUI()
         frameCountLayout->setSpacing(3);
         QLabel* frameCountLbl = new QLabel("Frames", frameCountGroup);
         frameCountLbl->setObjectName("compactLabel");
+        m_sidebarTdiFrameCountLabels[i] = frameCountLbl;
         m_sidebarTdiFrameCountEdits[i] = new QLineEdit(frameCountGroup);
         m_sidebarTdiFrameCountEdits[i]->setObjectName("compactEdit");
         m_sidebarTdiFrameCountEdits[i]->setValidator(new QIntValidator(1, 65535, this));
@@ -520,6 +706,7 @@ void MainWindow::buildUI()
         saveModeLayout->setSpacing(3);
         QLabel* saveModeLabel = new QLabel("Mode", saveModeRow);
         saveModeLabel->setObjectName("compactLabel");
+        m_sidebarSaveModeLabels[i] = saveModeLabel;
         m_sidebarSaveModeCombos[i] = new QComboBox(saveModeRow);
         m_sidebarSaveModeCombos[i]->addItems({"Sequence", "Single File"});
         m_sidebarSaveModeCombos[i]->setCurrentText("Sequence");
@@ -531,14 +718,30 @@ void MainWindow::buildUI()
         QHBoxLayout* durationLayout = new QHBoxLayout(durationRow);
         durationLayout->setContentsMargins(0, 0, 0, 0);
         durationLayout->setSpacing(4);
-        m_sidebarStopAfterDurationChecks[i] = new QCheckBox("Stop after", durationRow);
-        m_sidebarSaveDurationEdits[i] = new QLineEdit("5.0", durationRow);
-        m_sidebarSaveDurationEdits[i]->setPlaceholderText("Seconds");
-        m_sidebarSaveDurationEdits[i]->setEnabled(false);
-        connect(m_sidebarStopAfterDurationChecks[i], &QCheckBox::toggled,
-                m_sidebarSaveDurationEdits[i], &QLineEdit::setEnabled);
-        durationLayout->addWidget(m_sidebarStopAfterDurationChecks[i]);
-        durationLayout->addWidget(m_sidebarSaveDurationEdits[i], 1);
+
+        QLabel* durationLabel = new QLabel("Timer", durationRow);
+        durationLabel->setObjectName("compactLabel");
+
+        m_sidebarDurationSliders[i] = new QSlider(Qt::Horizontal, durationRow);
+        m_sidebarDurationSliders[i]->setRange(0, 4);
+        m_sidebarDurationSliders[i]->setSingleStep(1);
+        m_sidebarDurationSliders[i]->setPageStep(1);
+        m_sidebarDurationSliders[i]->setTickInterval(1);
+        m_sidebarDurationSliders[i]->setTickPosition(QSlider::TicksBelow);
+        m_sidebarDurationSliders[i]->setValue(1);
+
+        m_sidebarDurationSpins[i] = new QDoubleSpinBox(durationRow);
+        m_sidebarDurationSpins[i]->setRange(0.0, 3600.0);
+        m_sidebarDurationSpins[i]->setSingleStep(1.0);
+        m_sidebarDurationSpins[i]->setDecimals(1);
+        m_sidebarDurationSpins[i]->setSuffix(" s");
+        m_sidebarDurationSpins[i]->setSpecialValueText("Off");
+        m_sidebarDurationSpins[i]->setFixedWidth(64);
+        m_sidebarDurationSpins[i]->setValue(5.0);
+
+        durationLayout->addWidget(durationLabel);
+        durationLayout->addWidget(m_sidebarDurationSliders[i], 1);
+        durationLayout->addWidget(m_sidebarDurationSpins[i]);
         cardLayout->addWidget(durationRow);
 
         QHBoxLayout* regionBinningRow = new QHBoxLayout();
@@ -756,15 +959,29 @@ void MainWindow::buildUI()
         m_topSaveModeCombos[i]->addItems({"Sequence", "Single File"});
         m_topSaveModeCombos[i]->setCurrentText("Sequence");
         topSaveControlLayout->addWidget(topSaveModeLabel);
-        topSaveControlLayout->addWidget(m_topSaveModeCombos[i], 1);
-        m_topStopAfterDurationChecks[i] = new QCheckBox("Stop after", topSaveControlRow);
-        m_topSaveDurationEdits[i] = new QLineEdit("5.0", topSaveControlRow);
-        m_topSaveDurationEdits[i]->setPlaceholderText("Seconds");
-        m_topSaveDurationEdits[i]->setEnabled(false);
-        connect(m_topStopAfterDurationChecks[i], &QCheckBox::toggled,
-                m_topSaveDurationEdits[i], &QLineEdit::setEnabled);
-        topSaveControlLayout->addWidget(m_topStopAfterDurationChecks[i]);
-        topSaveControlLayout->addWidget(m_topSaveDurationEdits[i], 1);
+        QLabel* topDurationLbl = new QLabel("Timer", topSaveControlRow);
+        topDurationLbl->setObjectName("compactLabel");
+
+        m_topDurationSliders[i] = new QSlider(Qt::Horizontal, topSaveControlRow);
+        m_topDurationSliders[i]->setRange(0, 4);
+        m_topDurationSliders[i]->setSingleStep(1);
+        m_topDurationSliders[i]->setPageStep(1);
+        m_topDurationSliders[i]->setTickInterval(1);
+        m_topDurationSliders[i]->setTickPosition(QSlider::TicksBelow);
+        m_topDurationSliders[i]->setValue(1);
+
+        m_topDurationSpins[i] = new QDoubleSpinBox(topSaveControlRow);
+        m_topDurationSpins[i]->setRange(0.0, 3600.0);
+        m_topDurationSpins[i]->setSingleStep(1.0);
+        m_topDurationSpins[i]->setDecimals(1);
+        m_topDurationSpins[i]->setSuffix(" s");
+        m_topDurationSpins[i]->setSpecialValueText("Off");
+        m_topDurationSpins[i]->setFixedWidth(64);
+        m_topDurationSpins[i]->setValue(5.0);
+
+        topSaveControlLayout->addWidget(topDurationLbl);
+        topSaveControlLayout->addWidget(m_topDurationSliders[i], 1);
+        topSaveControlLayout->addWidget(m_topDurationSpins[i]);
         topCardLayout->addWidget(topSaveControlRow);
 
         QHBoxLayout* topRegionBinningRow = new QHBoxLayout();
@@ -813,7 +1030,14 @@ void MainWindow::buildUI()
     m_mainSplitter->addWidget(m_viewHost);
     m_mainSplitter->setStretchFactor(0, 0);
     m_mainSplitter->setStretchFactor(1, 1);
-    m_mainSplitter->setSizes({420, 1500});
+    m_mainSplitter->setSizes({410, 1510});
+    connect(m_mainSplitter, &QSplitter::splitterMoved, this, [this](int, int){
+        if (m_sidebarContainer && !m_controlsHidden && m_sidebarContainer->width() > 100) {
+            m_lastControlsWidth = m_sidebarContainer->width();
+        }
+        if (m_sidebarScroll) updateSidebarLabels(m_sidebarScroll->width());
+        updateCollapseButtonPosition();
+    });
 
     // ── Camera panels (controls only — scroll area hidden) ────────────
     for (int i = 0; i < 2; ++i)
@@ -902,8 +1126,8 @@ void MainWindow::buildUI()
             m_panels[i]->tdiFrameCountEdit->text(),
             m_panels[i]->reverseXCheck->isChecked(),
             m_panels[i]->reverseYCheck->isChecked(),
-            m_panels[i]->stopAfterDurationCheck->isChecked(),
-            m_panels[i]->saveDurationEdit->text());
+            m_panels[i]->saveDurationSpin ? (m_panels[i]->saveDurationSpin->value() > 0.0) : false,
+            m_panels[i]->saveDurationSpin ? QString::number(m_panels[i]->saveDurationSpin->value(), 'f', 1) : "5.0");
 
         auto syncCameraStateFromWidgets = [this, i]() {
             updateCameraUiState(i,
@@ -1178,46 +1402,93 @@ void MainWindow::buildUI()
                 m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, value, m_cameraUiStates[i].stopAfterEnabled, m_cameraUiStates[i].saveDuration);
         });
 
-        connect(m_panels[i]->stopAfterDurationCheck, &QCheckBox::toggled, this, [this, i](bool value) {
+        auto syncDurationFromSlider = [this, i](int sliderVal) {
+            double dur = sliderIndexToDuration(sliderVal, i);
+            bool enabled = (dur > 0.0);
+            QString durStr = QString::number(dur, 'f', 1);
             updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, value, m_cameraUiStates[i].saveDuration);
-        });
-        connect(m_sidebarStopAfterDurationChecks[i], &QCheckBox::toggled, this, [this, i](bool value) {
-            updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, value, m_cameraUiStates[i].saveDuration);
-        });
-        connect(m_topStopAfterDurationChecks[i], &QCheckBox::toggled, this, [this, i](bool value) {
-            updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, value, m_cameraUiStates[i].saveDuration);
-        });
+                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, enabled, durStr);
 
-        connect(m_panels[i]->saveDurationEdit, &QLineEdit::textEdited, this, [this, i](const QString& value) {
+            auto updateSlider = [](QSlider* s, int v) {
+                if (!s) return;
+                QSignalBlocker b(s);
+                s->setValue(v);
+            };
+            auto updateSpin = [](QDoubleSpinBox* sp, double v) {
+                if (!sp) return;
+                QSignalBlocker b(sp);
+                sp->setValue(v);
+            };
+
+            updateSlider(m_panels[i]->saveDurationSlider, sliderVal);
+            updateSpin(m_panels[i]->saveDurationSpin, dur);
+
+            updateSlider(m_sidebarDurationSliders[i], sliderVal);
+            updateSpin(m_sidebarDurationSpins[i], dur);
+
+            updateSlider(m_topDurationSliders[i], sliderVal);
+            updateSpin(m_topDurationSpins[i], dur);
+        };
+
+        auto syncDurationFromSpin = [this, i](double durVal) {
+            int sliderVal = durationToSliderIndex(durVal, i);
+            bool enabled = (durVal > 0.0);
+            QString durStr = QString::number(durVal, 'f', 1);
             updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, m_cameraUiStates[i].stopAfterEnabled, value);
-        });
-        connect(m_sidebarSaveDurationEdits[i], &QLineEdit::textEdited, this, [this, i](const QString& value) {
-            updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, m_cameraUiStates[i].stopAfterEnabled, value);
-        });
-        connect(m_topSaveDurationEdits[i], &QLineEdit::textEdited, this, [this, i](const QString& value) {
-            updateCameraAdvancedState(i, m_cameraUiStates[i].tdiMode, m_cameraUiStates[i].tdiStages, m_cameraUiStates[i].tdiYShift,
-                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, m_cameraUiStates[i].stopAfterEnabled, value);
-        });
+                m_cameraUiStates[i].tdiFrameCount, m_cameraUiStates[i].reverseX, m_cameraUiStates[i].reverseY, enabled, durStr);
+
+            auto updateSlider = [](QSlider* s, int v) {
+                if (!s) return;
+                QSignalBlocker b(s);
+                s->setValue(v);
+            };
+            auto updateSpin = [](QDoubleSpinBox* sp, double v) {
+                if (!sp) return;
+                QSignalBlocker b(sp);
+                sp->setValue(v);
+            };
+
+            updateSlider(m_panels[i]->saveDurationSlider, sliderVal);
+            updateSpin(m_panels[i]->saveDurationSpin, durVal);
+
+            updateSlider(m_sidebarDurationSliders[i], sliderVal);
+            updateSpin(m_sidebarDurationSpins[i], durVal);
+
+            updateSlider(m_topDurationSliders[i], sliderVal);
+            updateSpin(m_topDurationSpins[i], durVal);
+        };
+
+        if (m_panels[i]->saveDurationSlider) {
+            connect(m_panels[i]->saveDurationSlider, &QSlider::valueChanged, this, [syncDurationFromSlider](int val) {
+                syncDurationFromSlider(val);
+            });
+        }
+        if (m_panels[i]->saveDurationSpin) {
+            connect(m_panels[i]->saveDurationSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [syncDurationFromSpin](double val) {
+                syncDurationFromSpin(val);
+            });
+        }
+        if (m_sidebarDurationSliders[i]) {
+            connect(m_sidebarDurationSliders[i], &QSlider::valueChanged, this, [syncDurationFromSlider](int val) {
+                syncDurationFromSlider(val);
+            });
+        }
+        if (m_sidebarDurationSpins[i]) {
+            connect(m_sidebarDurationSpins[i], QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [syncDurationFromSpin](double val) {
+                syncDurationFromSpin(val);
+            });
+        }
+        if (m_topDurationSliders[i]) {
+            connect(m_topDurationSliders[i], &QSlider::valueChanged, this, [syncDurationFromSlider](int val) {
+                syncDurationFromSlider(val);
+            });
+        }
+        if (m_topDurationSpins[i]) {
+            connect(m_topDurationSpins[i], QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [syncDurationFromSpin](double val) {
+                syncDurationFromSpin(val);
+            });
+        }
         syncCameraStateFromWidgets();
-
-        bindCompactEdit(m_sidebarSaveDurationEdits[i], m_panels[i]->saveDurationEdit);
-        bindCompactEdit(m_topSaveDurationEdits[i], m_panels[i]->saveDurationEdit);
-        bindCompactEdit(m_panels[i]->saveDurationEdit, m_sidebarSaveDurationEdits[i]);
-        bindCompactEdit(m_panels[i]->saveDurationEdit, m_topSaveDurationEdits[i]);
-
-        connect(m_sidebarStopAfterDurationChecks[i], &QCheckBox::toggled,
-                m_panels[i]->stopAfterDurationCheck, &QCheckBox::setChecked);
-        connect(m_topStopAfterDurationChecks[i], &QCheckBox::toggled,
-                m_panels[i]->stopAfterDurationCheck, &QCheckBox::setChecked);
-        connect(m_panels[i]->stopAfterDurationCheck, &QCheckBox::toggled,
-                m_sidebarStopAfterDurationChecks[i], &QCheckBox::setChecked);
-        connect(m_panels[i]->stopAfterDurationCheck, &QCheckBox::toggled,
-                m_topStopAfterDurationChecks[i], &QCheckBox::setChecked);
 
         m_sidebarSavePathEdits[i]->setText(m_cameraUiStates[i].savePath);
         m_sidebarWidthEdits[i]->setText(m_cameraUiStates[i].width);
@@ -1234,9 +1505,13 @@ void MainWindow::buildUI()
         m_sidebarReverseYChecks[i]->setChecked(m_panels[i]->reverseYCheck->isChecked());
         m_sidebarSaveFormatCombos[i]->setCurrentText(m_cameraUiStates[i].saveFormat);
         if (m_sidebarSaveModeCombos[i]) m_sidebarSaveModeCombos[i]->setCurrentText(m_cameraUiStates[i].saveMode);
-        if (m_sidebarSaveDurationEdits[i]) m_sidebarSaveDurationEdits[i]->setText(m_panels[i]->saveDurationEdit->text());
+        double initDur = m_cameraUiStates[i].stopAfterEnabled ? m_cameraUiStates[i].saveDuration.toDouble() : 0.0;
+        int initIdx = durationToSliderIndex(initDur, i);
+        if (m_sidebarDurationSliders[i]) m_sidebarDurationSliders[i]->setValue(initIdx);
+        if (m_sidebarDurationSpins[i]) m_sidebarDurationSpins[i]->setValue(initDur);
         if (m_topSaveModeCombos[i]) m_topSaveModeCombos[i]->setCurrentText(m_cameraUiStates[i].saveMode);
-        if (m_topSaveDurationEdits[i]) m_topSaveDurationEdits[i]->setText(m_panels[i]->saveDurationEdit->text());
+        if (m_topDurationSliders[i]) m_topDurationSliders[i]->setValue(initIdx);
+        if (m_topDurationSpins[i]) m_topDurationSpins[i]->setValue(initDur);
         m_topSavePathEdits[i]->setText(m_cameraUiStates[i].savePath);
         m_topWidthEdits[i]->setText(m_cameraUiStates[i].width);
         m_topHeightEdits[i]->setText(m_cameraUiStates[i].height);
@@ -1297,7 +1572,9 @@ void MainWindow::buildUI()
 
         m_viewScrolls[i] = new QScrollArea();
         m_viewScrolls[i]->setObjectName("scrollArea");
-        m_viewLabels[i]  = new QLabel("No Signal");
+        auto* vvl = new VideoViewLabel();
+        vvl->setDarkMode(m_darkMode);
+        m_viewLabels[i] = vvl;
         m_viewLabels[i]->setObjectName("imageLabel");
         m_viewLabels[i]->setAlignment(Qt::AlignCenter);
         m_viewScrolls[i]->setWidget(m_viewLabels[i]);
@@ -1320,10 +1597,13 @@ void MainWindow::buildUI()
     }
 
     // ── Toolbar ───────────────────────────────────────────────────────
-    QToolBar* tb = new QToolBar("Main Toolbar", liveTab);
+    QToolBar* tb = new QToolBar("Main Toolbar", m_liveTab);
     tb->setObjectName("mainToolbar");
     tb->setMovable(false);
     tb->setFloatable(false);
+    if (tb->layout()) {
+        tb->layout()->setSpacing(10);
+    }
     liveTabLayout->insertWidget(0, tb);
 
     const int topBtnH = 20;
@@ -1337,49 +1617,51 @@ void MainWindow::buildUI()
         return cap;
     };
 
-    QPushButton* appName = new QPushButton("  ◈  DUAL DISPLAY  ");
-    appName->setObjectName("appNameBtn");
-    appName->setFixedHeight(topBtnH);
-    appName->setToolTip("Click to reset all values to default");
-    connect(appName, &QPushButton::clicked, this, &MainWindow::resetAllValuesToDefault);
-    tw(appName);
+    m_appCap = makeCapsule("appCapsule");
+    m_appCap->setCursor(Qt::PointingHandCursor);
+    m_appCap->setToolTip("Click to reset all values to default");
+    m_appCap->installEventFilter(this);
+    QHBoxLayout* appCapLay = qobject_cast<QHBoxLayout*>(m_appCap->layout());
+    appCapLay->setContentsMargins(4, 2, 4, 2);
+
+    m_appNameBtn = new QPushButton("Xdlinx Display Tool");
+    m_appNameBtn->setObjectName("appNameBtn");
+    m_appNameBtn->setFixedHeight(22);
+    m_appNameBtn->setIconSize(QSize(24, 14));
+    m_appNameBtn->setCursor(Qt::PointingHandCursor);
+    m_appNameBtn->setToolTip("Click to reset all values to default");
+    connect(m_appNameBtn, &QPushButton::clicked, this, &MainWindow::resetAllValuesToDefault);
+    appCapLay->addWidget(m_appNameBtn);
+    tw(m_appCap);
 
     // Layout Capsule
     QFrame* layoutCap = makeCapsule();
     QHBoxLayout* layoutCapLay = qobject_cast<QHBoxLayout*>(layoutCap->layout());
-    QLabel* layoutLabel = new QLabel("Layout:");
-    layoutLabel->setObjectName("capsuleLabel");
-    layoutCapLay->addWidget(layoutLabel);
 
-    m_layoutCombo = new QComboBox();
-    m_layoutCombo->setObjectName("layoutCombo");
-    m_layoutCombo->addItem("⬛⬛ Side by Side", static_cast<int>(PresetLayout::SideBySide));
-    m_layoutCombo->addItem("⬛/⬛ Top/Bottom", static_cast<int>(PresetLayout::TopBottom));
-    m_layoutCombo->addItem("⬜⬛ Dual Control", static_cast<int>(PresetLayout::DualControl));
-    m_layoutCombo->addItem("⬒⬒ Controls Top", static_cast<int>(PresetLayout::ControlsTop));
-    m_layoutCombo->setFixedWidth(120);
-    connect(m_layoutCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        int preset = m_layoutCombo->itemData(index).toInt();
-        switch(preset) {
-            case static_cast<int>(PresetLayout::SideBySide): applyPresetSideBySide(); break;
-            case static_cast<int>(PresetLayout::TopBottom): applyPresetTopBottom(); break;
-            case static_cast<int>(PresetLayout::DualControl): applyPresetDualControl(); break;
-            case static_cast<int>(PresetLayout::ControlsTop): applyPresetControlsTop(); break;
-            default: applyPresetSideBySide(); break;
-        }
-    });
-    layoutCapLay->addWidget(m_layoutCombo);
+    m_layoutBtn = new QPushButton(" Layout ▾ ");
+    m_layoutBtn->setObjectName("presetBtn");
+    m_layoutBtn->setFixedHeight(topBtnH);
+    m_layoutBtn->setCursor(Qt::PointingHandCursor);
+    m_layoutBtn->setToolTip("Select viewport layout preset");
+    m_layoutBtn->setStyleSheet("QPushButton::menu-indicator { width: 0px; }");
 
-    QPushButton* resetLayoutBtn = new QPushButton("↺ Reset");
-    resetLayoutBtn->setObjectName("resetBtn");
-    resetLayoutBtn->setToolTip("Reset all docks to default");
-    resetLayoutBtn->setFixedWidth(56);
-    resetLayoutBtn->setFixedHeight(topBtnH);
-    connect(resetLayoutBtn, &QPushButton::clicked, this, &MainWindow::applyPresetReset);
-    layoutCapLay->addWidget(resetLayoutBtn);
+    QMenu* layoutMenu = new QMenu(m_layoutBtn);
+    layoutMenu->setObjectName("layoutMenu");
+    m_layoutActions[0] = layoutMenu->addAction("⬛⬛ Side by Side",  this, &MainWindow::applyPresetSideBySide);
+    m_layoutActions[1] = layoutMenu->addAction("⬛/⬛ Top/Bottom",   this, &MainWindow::applyPresetTopBottom);
+    m_layoutActions[2] = layoutMenu->addAction("⬜⬛ Dual Control",  this, &MainWindow::applyPresetDualControl);
+    m_layoutActions[3] = layoutMenu->addAction("⬒⬒ Controls Top",  this, &MainWindow::applyPresetControlsTop);
+
+    for (int k = 0; k < 4; ++k) {
+        m_layoutActions[k]->setCheckable(true);
+    }
+    m_layoutActions[0]->setChecked(true);
+
+    m_layoutBtn->setMenu(layoutMenu);
+    layoutCapLay->addWidget(m_layoutBtn);
     tw(layoutCap);
 
-    // Display Capsule
+    // Display Capsule (on left side)
     QFrame* displayCap = makeCapsule();
     QHBoxLayout* displayCapLay = qobject_cast<QHBoxLayout*>(displayCap->layout());
     QLabel* displayModeLabel = new QLabel("Display:");
@@ -1408,28 +1690,9 @@ void MainWindow::buildUI()
     displayCapLay->addWidget(m_pixelStretchCheck);
     tw(displayCap);
 
-    // Theme Capsule
-    QFrame* themeCap = makeCapsule();
-    QHBoxLayout* themeCapLay = qobject_cast<QHBoxLayout*>(themeCap->layout());
-    QLabel* themeModeLabel = new QLabel("Theme:");
-    themeModeLabel->setObjectName("capsuleLabel");
-    themeCapLay->addWidget(themeModeLabel);
-
-    QLabel* lightLabel = new QLabel("Light");
-    lightLabel->setObjectName("modeSideLabel");
-    themeCapLay->addWidget(lightLabel);
-
-    m_darkModeBtn = new DisplayModeSwitch(this);
-    m_darkModeBtn->setObjectName("darkModeSwitch");
-    m_darkModeBtn->setToolTip("Theme switch: left is Light, right is Dark");
-    m_darkModeBtn->setChecked(false);
-    connect(m_darkModeBtn, &QPushButton::clicked, this, &MainWindow::onDarkModeToggled);
-    themeCapLay->addWidget(m_darkModeBtn);
-
-    QLabel* darkLabel = new QLabel("Dark");
-    darkLabel->setObjectName("modeSideLabel");
-    themeCapLay->addWidget(darkLabel);
-    tw(themeCap);
+    // Spacer to push remaining capture/sync controls and theme toggle to the right
+    QWidget* sp = new QWidget(); sp->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    tw(sp);
 
     // Sync Capsule
     QFrame* syncCap = makeCapsule();
@@ -1462,6 +1725,8 @@ void MainWindow::buildUI()
     m_startCalibrationBtn->setFixedHeight(topBtnH);
 
     m_syncStackedWidget = new QStackedWidget();
+    m_syncStackedWidget->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    m_syncStackedWidget->setFixedWidth(75);
     m_syncStackedWidget->addWidget(m_lineDelaySpin);       // index 0
     m_syncStackedWidget->addWidget(m_timeDelaySpin);       // index 1
     m_syncStackedWidget->addWidget(m_startCalibrationBtn); // index 2
@@ -1542,15 +1807,9 @@ void MainWindow::buildUI()
     saveCapLay->addWidget(m_saveAllBtn);
     tw(saveCap);
 
-    // View Capsule (Hide Controls, Float Monitor 2)
+    // View Capsule (Float Monitor 2)
     QFrame* viewCap = makeCapsule();
     QHBoxLayout* viewCapLay = qobject_cast<QHBoxLayout*>(viewCap->layout());
-
-    m_toggleControlsBtn = new QPushButton(" Hide Controls ");
-    m_toggleControlsBtn->setObjectName("presetBtn");
-    m_toggleControlsBtn->setFixedWidth(94);
-    m_toggleControlsBtn->setFixedHeight(topBtnH);
-    connect(m_toggleControlsBtn, &QPushButton::clicked, this, &MainWindow::onToggleControlsClicked);
 
     m_floatCam1Btn = new QPushButton(" ⧉ Cam1 → Monitor 2 ");
     m_floatCam1Btn->setObjectName("floatBtn");
@@ -1560,13 +1819,18 @@ void MainWindow::buildUI()
     m_floatCam1Btn->setFocusPolicy(Qt::NoFocus);
     m_floatCam1Btn->installEventFilter(this);
 
-    viewCapLay->addWidget(m_toggleControlsBtn);
     viewCapLay->addWidget(m_floatCam1Btn);
     tw(viewCap);
 
-    // Spacer
-    QWidget* sp = new QWidget(); sp->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    tw(sp);
+    // Theme Capsule (in corner)
+    QFrame* themeCap = makeCapsule();
+    QHBoxLayout* themeCapLay = qobject_cast<QHBoxLayout*>(themeCap->layout());
+    m_darkModeBtn = new ThemeToggleSwitch(this);
+    m_darkModeBtn->setObjectName("darkModeSwitch");
+    m_darkModeBtn->setDarkMode(m_darkMode, false);
+    connect(m_darkModeBtn, &QAbstractButton::clicked, this, &MainWindow::onDarkModeToggled);
+    themeCapLay->addWidget(m_darkModeBtn);
+    tw(themeCap);
 }
 
 void MainWindow::appendLogLine(const QString& line)
@@ -1652,12 +1916,23 @@ void MainWindow::resetViewLayout()
     }
 }
 
+void MainWindow::updateLayoutMenuCheckmark(PresetLayout preset)
+{
+    const int idx = static_cast<int>(preset);
+    for (int k = 0; k < 4; ++k) {
+        if (m_layoutActions[k]) {
+            m_layoutActions[k]->setChecked(k == idx);
+        }
+    }
+}
+
 void MainWindow::applyPresetSideBySide()
 {
     m_currentPreset = PresetLayout::SideBySide;
+    updateLayoutMenuCheckmark(m_currentPreset);
     resetControlLayout();
     resetViewLayout();
-    m_sidebarScroll->setMinimumWidth(260);
+    m_sidebarScroll->setMinimumWidth(380);
     for (int i = 0; i < 2; ++i)
     {
         if (m_panels[i]->sensorTempLabel)  m_panels[i]->sensorTempLabel->setVisible(true);
@@ -1680,9 +1955,10 @@ void MainWindow::applyPresetSideBySide()
 void MainWindow::applyPresetTopBottom()
 {
     m_currentPreset = PresetLayout::TopBottom;
+    updateLayoutMenuCheckmark(m_currentPreset);
     resetControlLayout();
     resetViewLayout();
-    m_sidebarScroll->setMinimumWidth(260);
+    m_sidebarScroll->setMinimumWidth(380);
     for (int i = 0; i < 2; ++i)
     {
         if (m_panels[i]->sensorTempLabel)  m_panels[i]->sensorTempLabel->setVisible(true);
@@ -1705,6 +1981,7 @@ void MainWindow::applyPresetTopBottom()
 void MainWindow::applyPresetDualControl()
 {
     m_currentPreset = PresetLayout::DualControl;
+    updateLayoutMenuCheckmark(m_currentPreset);
     resetControlLayout();
     resetViewLayout();
     m_sidebarScroll->setMinimumWidth(440);
@@ -1746,6 +2023,7 @@ void MainWindow::applyPresetDualControl()
 void MainWindow::applyPresetControlsTop()
 {
     m_currentPreset = PresetLayout::ControlsTop;
+    updateLayoutMenuCheckmark(m_currentPreset);
     resetControlLayout();
     resetViewLayout();
     for (int i = 0; i < 2; ++i)
@@ -1807,6 +2085,33 @@ void MainWindow::onFloatCam1ToMonitor2()
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_sidebarScroll && event->type() == QEvent::Resize)
+    {
+        auto* re = static_cast<QResizeEvent*>(event);
+        updateSidebarLabels(re->size().width());
+    }
+
+    if ((watched == m_liveTab || watched == m_mainSplitter || watched == m_sidebarContainer ||
+         watched == m_rootSplitter || watched == m_logContainer) &&
+        (event->type() == QEvent::Resize || event->type() == QEvent::Move || event->type() == QEvent::Show))
+    {
+        updateCollapseButtonPosition();
+        updateLogButtonPosition();
+    }
+
+    if (watched == m_appCap)
+    {
+        if (event->type() == QEvent::MouseButtonRelease)
+        {
+            auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton && m_appCap->rect().contains(mouseEvent->pos()))
+            {
+                resetAllValuesToDefault();
+                return true;
+            }
+        }
+    }
+
     if (watched == m_floatCam1Btn)
     {
         switch (event->type())
@@ -1839,7 +2144,11 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
 
         if ((v1 && watched == v1) || (v2 && watched == v2))
         {
-            if (event->type() == QEvent::Wheel)
+            if (event->type() == QEvent::Resize)
+            {
+                refreshDisplay(i);
+            }
+            else if (event->type() == QEvent::Wheel)
             {
                 QWheelEvent* we = static_cast<QWheelEvent*>(event);
                 int delta = we->angleDelta().y();
@@ -1899,68 +2208,137 @@ void MainWindow::refreshDisplay(int idx)
     if (pixels.size() < expectedBytes) return;
 
     const uint8_t* src = pixels.data();
-    std::vector<uint8_t> buf;
-    if (m_pixelStretch)
+    if (m_pixelStretch && expectedBytes > 0)
     {
-        auto mn = *std::min_element(pixels.begin(), pixels.end());
-        auto mx = *std::max_element(pixels.begin(), pixels.end());
-        if (mn != mx)
+        uint8_t mn = 255;
+        uint8_t mx = 0;
+        const size_t sampleStride = 32;
+        for (size_t k = 0; k < expectedBytes; k += sampleStride) {
+            uint8_t val = src[k];
+            if (val < mn) mn = val;
+            if (val > mx) mx = val;
+            if (mn == 0 && mx == 255) break;
+        }
+        if (mn < mx && !(mn == 0 && mx == 255))
         {
-            buf.resize(pixels.size());
-            float s = 255.0f / (mx - mn);
-            for (size_t i = 0; i < pixels.size(); ++i)
-                buf[i] = (uint8_t)((pixels[i] - mn) * s);
-            src = buf.data();
+            uint8_t lut[256];
+            const float s = 255.0f / static_cast<float>(mx - mn);
+            for (int v = 0; v < 256; ++v) {
+                if (v <= mn) lut[v] = 0;
+                else if (v >= mx) lut[v] = 255;
+                else lut[v] = static_cast<uint8_t>((v - mn) * s + 0.5f);
+            }
+
+            if (m_pixelStretchBuf[idx].size() != expectedBytes) {
+                m_pixelStretchBuf[idx].resize(expectedBytes);
+            }
+            uint8_t* dst = m_pixelStretchBuf[idx].data();
+
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < expectedBytes; ++i) {
+                dst[i] = lut[src[i]];
+            }
+            src = dst;
         }
     }
 
-    QImage img(src, pkt.width, displayHeight, pkt.width, QImage::Format_Grayscale8);
-    QPixmap px;
-    double zoom = m_zoomFactors[idx];
-    if (m_fitToScreen && zoom == 1.0) {
-        QSize targetSize;
-        if (m_viewScrolls[idx] && m_viewScrolls[idx]->viewport()) {
-            targetSize = m_viewScrolls[idx]->viewport()->size();
-        }
+    QScrollArea* sa = (m_currentPreset == PresetLayout::DualControl && m_panels[idx])
+        ? m_panels[idx]->scrollArea
+        : m_viewScrolls[idx];
 
-        if (targetSize.isValid() && !targetSize.isEmpty()) {
-            QImage scaledImg = img.scaled(targetSize, Qt::KeepAspectRatio, Qt::FastTransformation);
-            px = QPixmap::fromImage(scaledImg);
-        } else {
-            px = QPixmap::fromImage(img);
-        }
+    QSize viewSize(800, 600);
+    if (sa && sa->viewport() && sa->viewport()->width() > 10 && sa->viewport()->height() > 10) {
+        viewSize = sa->viewport()->size();
+    }
+
+    const bool stretchMode = m_displayModeBtn && m_displayModeBtn->isChecked();
+    const Qt::AspectRatioMode aspectMode = stretchMode ? Qt::IgnoreAspectRatio : Qt::KeepAspectRatio;
+    const double zoom = m_zoomFactors[idx];
+
+    int step = 1;
+    if (zoom <= 1.0) step = 4;
+    else if (zoom <= 2.0) step = 2;
+    else step = 1;
+
+    const int previewW = pkt.width / step;
+    const int previewH = displayHeight / step;
+    const size_t previewSize = static_cast<size_t>(previewW) * previewH;
+
+    if (m_previewBuf[idx].size() != previewSize) {
+        m_previewBuf[idx].resize(previewSize);
+    }
+    uint8_t* previewData = m_previewBuf[idx].data();
+
+    if (step == 1) {
+        std::memcpy(previewData, src, previewSize);
     } else {
-        QSize baseSize;
-        if (m_fitToScreen && m_viewScrolls[idx] && m_viewScrolls[idx]->viewport() && !m_viewScrolls[idx]->viewport()->size().isEmpty()) {
-            baseSize = img.scaled(m_viewScrolls[idx]->viewport()->size(), Qt::KeepAspectRatio, Qt::FastTransformation).size();
-        } else {
-            baseSize = QSize(pkt.width, displayHeight);
-        }
-        QSize targetSize = baseSize * zoom;
-        if (targetSize.width() > 0 && targetSize.height() > 0) {
-            QImage scaledImg = img.scaled(targetSize, Qt::KeepAspectRatio, Qt::FastTransformation);
-            px = QPixmap::fromImage(scaledImg);
-        } else {
-            px = QPixmap::fromImage(img);
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < previewH; ++y) {
+            const uint8_t* rowSrc = src + static_cast<size_t>(y * step) * pkt.width;
+            uint8_t* rowDst = previewData + static_cast<size_t>(y) * previewW;
+            for (int x = 0; x < previewW; ++x) {
+                rowDst[x] = rowSrc[x * step];
+            }
         }
     }
-    
+
+    QImage previewImg(previewData, previewW, previewH, previewW, QImage::Format_Grayscale8);
+    QSize targetSize;
+    if (zoom <= 1.0) {
+        targetSize = (aspectMode == Qt::KeepAspectRatio)
+            ? previewImg.scaled(viewSize, Qt::KeepAspectRatio, Qt::FastTransformation).size()
+            : viewSize;
+    } else {
+        QSize baseSize = (aspectMode == Qt::KeepAspectRatio)
+            ? previewImg.scaled(viewSize, Qt::KeepAspectRatio, Qt::FastTransformation).size()
+            : viewSize;
+        targetSize = baseSize * zoom;
+    }
+
+    if (targetSize.width() <= 0 || targetSize.height() <= 0) {
+        targetSize = viewSize;
+    }
+
+    QImage scaledImg = previewImg.scaled(targetSize, aspectMode, Qt::FastTransformation);
+    QPixmap px = QPixmap::fromImage(scaledImg);
+
     if (m_calibrationEngine && m_calibrationEngine->isCalibrating()) {
         QPainter p(&px);
         p.setPen(QPen(Qt::red, 3));
         p.drawLine(0, px.height() / 2, px.width(), px.height() / 2);
     }
-    
+
+    if (m_viewScrolls[idx]) {
+        if (zoom <= 1.0) {
+            m_viewScrolls[idx]->setWidgetResizable(true);
+        } else {
+            m_viewScrolls[idx]->setWidgetResizable(false);
+            if (m_viewLabels[idx]) m_viewLabels[idx]->resize(targetSize);
+        }
+    }
     if (m_viewLabels[idx]) {
         m_viewLabels[idx]->setPixmap(px);
-        m_viewLabels[idx]->adjustSize();
+        if (zoom > 1.0) {
+            m_viewLabels[idx]->resize(targetSize);
+        }
     }
+
     if (m_panels[idx]) {
         m_panels[idx]->lastPixmap = px;
         m_panels[idx]->updateFrameInfo(pkt, pixels);
-        if (m_panels[idx]->imageLabel) {
+        if (m_panels[idx]->scrollArea) {
+            if (zoom <= 1.0) {
+                m_panels[idx]->scrollArea->setWidgetResizable(true);
+            } else {
+                m_panels[idx]->scrollArea->setWidgetResizable(false);
+                if (m_panels[idx]->imageLabel) m_panels[idx]->imageLabel->resize(targetSize);
+            }
+        }
+        if (m_panels[idx]->imageLabel && m_panels[idx]->imageLabel != m_viewLabels[idx]) {
             m_panels[idx]->imageLabel->setPixmap(px);
-            m_panels[idx]->imageLabel->adjustSize();
+            if (zoom > 1.0) {
+                m_panels[idx]->imageLabel->resize(targetSize);
+            }
         }
     }
     if (idx == 1 && m_panels[1]->isDetached && m_detachedView)
@@ -2016,8 +2394,8 @@ void MainWindow::syncSidebarButtons(int idx)
         setWidgetEnabled(m_panels[idx]->startBtn, isConn);
         setWidgetEnabled(m_panels[idx]->savePathEdit, !isSaving);
         setWidgetEnabled(m_panels[idx]->browseRawBtn, !isSaving);
-        setWidgetEnabled(m_panels[idx]->stopAfterDurationCheck, !isSaving);
-        setWidgetEnabled(m_panels[idx]->saveDurationEdit, !isSaving && m_panels[idx]->stopAfterDurationCheck && m_panels[idx]->stopAfterDurationCheck->isChecked());
+        setWidgetEnabled(m_panels[idx]->saveDurationSlider, !isSaving);
+        setWidgetEnabled(m_panels[idx]->saveDurationSpin, !isSaving);
     }
 
     setWidgetEnabled(m_sidebarSettingsBtns[idx], allowGeometryChange);
@@ -2063,8 +2441,10 @@ void MainWindow::syncSidebarButtons(int idx)
 
     setWidgetEnabled(m_sidebarSavePathEdits[idx], !isSaving);
     setWidgetEnabled(m_topSavePathEdits[idx], !isSaving);
-    setWidgetEnabled(m_sidebarSaveDurationEdits[idx], !isSaving);
-    setWidgetEnabled(m_topSaveDurationEdits[idx], !isSaving);
+    setWidgetEnabled(m_sidebarDurationSliders[idx], !isSaving);
+    setWidgetEnabled(m_sidebarDurationSpins[idx], !isSaving);
+    setWidgetEnabled(m_topDurationSliders[idx], !isSaving);
+    setWidgetEnabled(m_topDurationSpins[idx], !isSaving);
 
     if (m_sidebarConnectBtns[idx]) m_sidebarConnectBtns[idx]->setText(m_panels[idx]->connectBtn->text());
     if (m_sidebarStartBtns[idx])   m_sidebarStartBtns[idx]->setText(m_panels[idx]->startBtn->text());
@@ -2104,7 +2484,16 @@ void MainWindow::syncSidebarButtons(int idx)
     if (m_sidebarGainEdits[idx])     m_sidebarGainEdits[idx]->setText(m_cameraUiStates[idx].gain);
     if (m_sidebarSaveFormatCombos[idx]) m_sidebarSaveFormatCombos[idx]->setCurrentText(m_cameraUiStates[idx].saveFormat);
     if (m_sidebarSaveModeCombos[idx])   m_sidebarSaveModeCombos[idx]->setCurrentText(m_cameraUiStates[idx].saveMode);
-    if (m_sidebarSaveDurationEdits[idx]) m_sidebarSaveDurationEdits[idx]->setText(m_cameraUiStates[idx].saveDuration);
+    double curDur = m_cameraUiStates[idx].stopAfterEnabled ? m_cameraUiStates[idx].saveDuration.toDouble() : 0.0;
+    int sIdx = durationToSliderIndex(curDur, idx);
+    if (m_sidebarDurationSliders[idx]) {
+        QSignalBlocker b(m_sidebarDurationSliders[idx]);
+        m_sidebarDurationSliders[idx]->setValue(sIdx);
+    }
+    if (m_sidebarDurationSpins[idx]) {
+        QSignalBlocker b(m_sidebarDurationSpins[idx]);
+        m_sidebarDurationSpins[idx]->setValue(curDur);
+    }
 
     if (m_topConnectBtns[idx]) m_topConnectBtns[idx]->setText(m_panels[idx]->connectBtn->text());
     if (m_topStartBtns[idx])   m_topStartBtns[idx]->setText(m_panels[idx]->startBtn->text());
@@ -2142,7 +2531,14 @@ void MainWindow::syncSidebarButtons(int idx)
     if (m_topGainEdits[idx])     m_topGainEdits[idx]->setText(m_cameraUiStates[idx].gain);
     if (m_topSaveFormatCombos[idx]) m_topSaveFormatCombos[idx]->setCurrentText(m_cameraUiStates[idx].saveFormat);
     if (m_topSaveModeCombos[idx])   m_topSaveModeCombos[idx]->setCurrentText(m_cameraUiStates[idx].saveMode);
-    if (m_topSaveDurationEdits[idx]) m_topSaveDurationEdits[idx]->setText(m_cameraUiStates[idx].saveDuration);
+    if (m_topDurationSliders[idx]) {
+        QSignalBlocker b(m_topDurationSliders[idx]);
+        m_topDurationSliders[idx]->setValue(sIdx);
+    }
+    if (m_topDurationSpins[idx]) {
+        QSignalBlocker b(m_topDurationSpins[idx]);
+        m_topDurationSpins[idx]->setValue(curDur);
+    }
 
     bool allConnected = m_connected[0] && m_connected[1];
     bool anyStreaming = m_streaming[0] || m_streaming[1];
@@ -2437,9 +2833,9 @@ void MainWindow::applyCameraSourceSelection(int slot)
     if (slot < 0 || slot > 1 || !m_cameraManager) return;
     int detectedIndex = -1;
     if (m_sidebarSourceCombos[slot])
-        detectedIndex = m_sidebarSourceCombos[slot]->currentIndex();
+        detectedIndex = m_sidebarSourceCombos[slot]->currentData().toInt();
     else if (m_topSourceCombos[slot])
-        detectedIndex = m_topSourceCombos[slot]->currentIndex();
+        detectedIndex = m_topSourceCombos[slot]->currentData().toInt();
 
     m_cameraManager->assignCameraSource(slot, detectedIndex);
     if (m_panels[slot] && m_panels[slot]->connectBtn) {
@@ -2486,11 +2882,16 @@ void MainWindow::applyCameraUiStateToWidgets(int idx)
         QSignalBlocker blocker(m_panels[idx]->reverseYCheck);
         m_panels[idx]->reverseYCheck->setChecked(state.reverseY);
     }
-    if (m_panels[idx]->stopAfterDurationCheck && m_panels[idx]->stopAfterDurationCheck->isChecked() != state.stopAfterEnabled) {
-        QSignalBlocker blocker(m_panels[idx]->stopAfterDurationCheck);
-        m_panels[idx]->stopAfterDurationCheck->setChecked(state.stopAfterEnabled);
+    double durVal = state.stopAfterEnabled ? state.saveDuration.toDouble() : 0.0;
+    int sIdx = durationToSliderIndex(durVal, idx);
+    if (m_panels[idx]->saveDurationSlider) {
+        QSignalBlocker blocker(m_panels[idx]->saveDurationSlider);
+        m_panels[idx]->saveDurationSlider->setValue(sIdx);
     }
-    setEditText(m_panels[idx]->saveDurationEdit, state.saveDuration);
+    if (m_panels[idx]->saveDurationSpin) {
+        QSignalBlocker blocker(m_panels[idx]->saveDurationSpin);
+        m_panels[idx]->saveDurationSpin->setValue(durVal);
+    }
 
     setEditText(m_sidebarWidthEdits[idx], state.width);
     setEditText(m_sidebarHeightEdits[idx], state.height);
@@ -2513,11 +2914,14 @@ void MainWindow::applyCameraUiStateToWidgets(int idx)
         QSignalBlocker blocker(m_sidebarReverseYChecks[idx]);
         m_sidebarReverseYChecks[idx]->setChecked(state.reverseY);
     }
-    if (m_sidebarStopAfterDurationChecks[idx] && m_sidebarStopAfterDurationChecks[idx]->isChecked() != state.stopAfterEnabled) {
-        QSignalBlocker blocker(m_sidebarStopAfterDurationChecks[idx]);
-        m_sidebarStopAfterDurationChecks[idx]->setChecked(state.stopAfterEnabled);
+    if (m_sidebarDurationSliders[idx]) {
+        QSignalBlocker blocker(m_sidebarDurationSliders[idx]);
+        m_sidebarDurationSliders[idx]->setValue(sIdx);
     }
-    setEditText(m_sidebarSaveDurationEdits[idx], state.saveDuration);
+    if (m_sidebarDurationSpins[idx]) {
+        QSignalBlocker blocker(m_sidebarDurationSpins[idx]);
+        m_sidebarDurationSpins[idx]->setValue(durVal);
+    }
 
     setEditText(m_topWidthEdits[idx], state.width);
     setEditText(m_topHeightEdits[idx], state.height);
@@ -2540,11 +2944,14 @@ void MainWindow::applyCameraUiStateToWidgets(int idx)
         QSignalBlocker blocker(m_topReverseYChecks[idx]);
         m_topReverseYChecks[idx]->setChecked(state.reverseY);
     }
-    if (m_topStopAfterDurationChecks[idx] && m_topStopAfterDurationChecks[idx]->isChecked() != state.stopAfterEnabled) {
-        QSignalBlocker blocker(m_topStopAfterDurationChecks[idx]);
-        m_topStopAfterDurationChecks[idx]->setChecked(state.stopAfterEnabled);
+    if (m_topDurationSliders[idx]) {
+        QSignalBlocker blocker(m_topDurationSliders[idx]);
+        m_topDurationSliders[idx]->setValue(sIdx);
     }
-    setEditText(m_topSaveDurationEdits[idx], state.saveDuration);
+    if (m_topDurationSpins[idx]) {
+        QSignalBlocker blocker(m_topDurationSpins[idx]);
+        m_topDurationSpins[idx]->setValue(durVal);
+    }
     updateTdiUiVisibility(idx);
 }
 
@@ -2579,7 +2986,9 @@ void MainWindow::updateWorkerParams(int idx)
     params.width = m_cameraUiStates[idx].width.toInt();
     params.height = m_cameraUiStates[idx].height.toInt();
     params.fps = m_cameraUiStates[idx].fps.toFloat();
+    if (params.fps <= 0.05f) params.fps = 10.0f;
     params.exposure = m_cameraUiStates[idx].exposure.toFloat();
+    if (params.exposure < 100.0f) params.exposure = 5000.0f;
     params.gain = m_cameraUiStates[idx].gain.toFloat();
     params.testPattern = (m_cameraUiStates[idx].testPattern == "Gray Diagonal Ramp") ? 1 : 0;
     const int tdiModeIndex = m_panels[idx]->tdiModeCombo
@@ -2683,6 +3092,68 @@ void MainWindow::updateTdiUiVisibility(int idx)
     }
 }
 
+void MainWindow::updateSidebarLabels(int panelWidth)
+{
+    const bool expanded = (panelWidth >= 320);
+    if (m_sidebarExpanded == expanded) return;
+    m_sidebarExpanded = expanded;
+
+    for (int i = 0; i < 2; ++i)
+    {
+        if (m_sidebarWidthLabels[i])
+            m_sidebarWidthLabels[i]->setText(expanded ? "Width" : "W");
+        if (m_sidebarHeightLabels[i])
+            m_sidebarHeightLabels[i]->setText(expanded ? "Height" : "H");
+        if (m_sidebarFpsLabels[i])
+            m_sidebarFpsLabels[i]->setText(expanded ? "Frame Rate" : "FPS");
+        if (m_sidebarExposureLabels[i])
+            m_sidebarExposureLabels[i]->setText(expanded ? "Exposure" : "Exp");
+        if (m_sidebarGainLabels[i])
+            m_sidebarGainLabels[i]->setText(expanded ? "Gain" : "Gain");
+        if (m_sidebarTestPatternLabels[i])
+            m_sidebarTestPatternLabels[i]->setText(expanded ? "Test Pattern" : "Test");
+        if (m_sidebarReverseXChecks[i])
+            m_sidebarReverseXChecks[i]->setText(expanded ? "Reverse X" : "RevX");
+        if (m_sidebarReverseYChecks[i])
+            m_sidebarReverseYChecks[i]->setText(expanded ? "Reverse Y" : "RevY");
+        if (m_sidebarTdiStagesLabels[i])
+            m_sidebarTdiStagesLabels[i]->setText(expanded ? "TDI Stages" : "Stg");
+        if (m_sidebarTdiYShiftLabels[i])
+            m_sidebarTdiYShiftLabels[i]->setText(expanded ? "TDI Y-Shift" : "Y-Shift");
+        if (m_sidebarTdiFrameCountLabels[i])
+            m_sidebarTdiFrameCountLabels[i]->setText(expanded ? "Frame Count" : "Frames");
+        if (m_sidebarSaveModeLabels[i])
+            m_sidebarSaveModeLabels[i]->setText(expanded ? "Save Mode" : "Mode");
+    }
+}
+
+double MainWindow::sliderIndexToDuration(int sliderVal, int camIdx) const
+{
+    if (camIdx < 0 || camIdx > 1) camIdx = 0;
+    if (sliderVal <= 0) return 0.0;
+    if (sliderVal == 1) return 5.0;
+    if (sliderVal == 2) return 10.0;
+    if (sliderVal == 3) return 15.0;
+    return m_customLastDuration[camIdx];
+}
+
+int MainWindow::durationToSliderIndex(double dur, int camIdx)
+{
+    if (camIdx < 0 || camIdx > 1) camIdx = 0;
+    if (dur <= 0.0) return 0;
+    if (std::abs(dur - 5.0) < 0.25) return 1;
+    if (std::abs(dur - 10.0) < 0.25) return 2;
+    if (std::abs(dur - 15.0) < 0.25) return 3;
+    if (dur > 15.0) {
+        m_customLastDuration[camIdx] = dur;
+        return 4;
+    }
+    if (dur < 2.5) return 0;
+    if (dur < 7.5) return 1;
+    if (dur < 12.5) return 2;
+    return 3;
+}
+
 // ── Per-camera slots ──────────────────────────────────────────────────
 void MainWindow::onConnectClicked(int idx)
 {
@@ -2690,6 +3161,16 @@ void MainWindow::onConnectClicked(int idx)
     if (!m_connected[idx])
     {
         applyCameraSourceSelection(idx);
+        if (m_cameraManager->camHandle(idx) == INVALID_CAMHANDLE)
+        {
+            detectCameras();
+            applyCameraSourceSelection(idx);
+            if (m_cameraManager->camHandle(idx) == INVALID_CAMHANDLE)
+            {
+                QMessageBox::warning(this, "Connect", QString("Select a detected source for CAM %1 first.").arg(idx));
+                return;
+            }
+        }
         int newOffset = getActiveRegionOffset(idx);
         int oldOffset = m_lastAppliedRegionOffset[idx];
         if (newOffset != oldOffset) {
@@ -2729,7 +3210,6 @@ void MainWindow::onStartClicked(int idx)
         return;
     }
 
-    updateWorkerParams(idx);
     m_cameraManager->startStream(idx);
 }
 
@@ -2893,9 +3373,7 @@ void MainWindow::onStartAllClicked()
 {
     bool anyStreaming = m_streaming[0] || m_streaming[1];
     if (anyStreaming) {
-        for (int i = 0; i < 2; ++i) {
-            if (m_streaming[i]) onStartClicked(i);
-        }
+        if (m_cameraManager) m_cameraManager->stopAllStreams();
         return;
     }
 
@@ -2904,11 +3382,8 @@ void MainWindow::onStartAllClicked()
         return;
     }
 
-    for (int i = 0; i < 2; ++i) {
-        if (m_connected[i] && !m_streaming[i]) {
-            updateWorkerParams(i);
-            if (m_cameraManager) m_cameraManager->startStream(i);
-        }
+    if (m_cameraManager) {
+        m_cameraManager->startAllStreams();
     }
 }
 
@@ -2984,6 +3459,47 @@ void MainWindow::onToggleControlsClicked()
     applyControlVisibility();
 }
 
+void MainWindow::onToggleLogClicked()
+{
+    m_logHidden = !m_logHidden;
+    const int totalH = m_rootSplitter ? m_rootSplitter->height() : height();
+
+    if (m_logHidden) {
+        if (m_logContainer && m_logContainer->height() > 30) {
+            m_lastLogHeight = m_logContainer->height();
+        }
+        if (m_logContainer) {
+            m_logContainer->hide();
+        }
+        if (m_logCollapseBtn) {
+            m_logCollapseBtn->setText(QString::fromUtf8("▲"));
+            m_logCollapseBtn->setToolTip("Show Terminal (▲)");
+        }
+        if (m_rootSplitter) {
+            m_rootSplitter->setSizes({totalH, 0});
+        }
+    } else {
+        if (m_logContainer) {
+            m_logContainer->setMinimumHeight(30);
+            m_logContainer->setMaximumHeight(QWIDGETSIZE_MAX);
+            m_logContainer->show();
+        }
+        if (m_logTerminal) {
+            m_logTerminal->show();
+        }
+        if (m_logCollapseBtn) {
+            m_logCollapseBtn->setText(QString::fromUtf8("▼"));
+            m_logCollapseBtn->setToolTip("Hide Terminal (▼)");
+        }
+        if (m_rootSplitter) {
+            int restoreH = m_lastLogHeight > 40 ? m_lastLogHeight : 96;
+            m_rootSplitter->setSizes({std::max(100, totalH - restoreH), restoreH});
+        }
+    }
+
+    updateLogButtonPosition();
+}
+
 
 
 // ── Worker signal handlers ────────────────────────────────────────────
@@ -2998,11 +3514,6 @@ void MainWindow::onFrameReady(FramePacketPtr pkt)
     const double timeDelaySec = m_timeDelaySpin ? m_timeDelaySpin->value() : 0.0;
     const double fps = m_cameraUiStates[0].fps.toDouble();
 
-    const bool mustProcessEveryFrame = (m_captureController && (m_captureController->isSaving(idx) || m_captureController->isMergeSaving()))
-                                    || (m_calibrationEngine && m_calibrationEngine->isCalibrating());
-    if (!mustProcessEveryFrame && pkt->timestampMs > 0 && now - pkt->timestampMs > 100)
-        return;
-
     if (m_calibrationEngine) {
         pkt = m_calibrationEngine->processFrame(pkt, syncMode, timeDelaySec, fps);
     }
@@ -3016,14 +3527,19 @@ void MainWindow::onFrameReady(FramePacketPtr pkt)
         }
     }
 
-    double cameraFps = std::max(1.0, m_cameraUiStates[idx].fps.toDouble());
-    int limitMs = std::max(1, (int)(1000.0 / cameraFps) - 2);
-    const bool displayFrameFresh = (pkt->timestampMs <= 0 || now - pkt->timestampMs <= 100);
-    const bool updateDisplay = displayFrameFresh && (m_lastDisplayMs[idx] == 0 || now - m_lastDisplayMs[idx] >= limitMs);
+    double cameraFps = std::max(0.1, m_cameraUiStates[idx].fps.toDouble());
+    const int limitMs = std::max(33, static_cast<int>(1000.0 / cameraFps) - 5);
+    const bool updateDisplay = (m_lastDisplayMs[idx] == 0 || now - m_lastDisplayMs[idx] >= limitMs);
     if (updateDisplay) {
         m_lastDisplayMs[idx] = now;
         refreshDisplay(idx);
-        if (m_viewFpsLabels[idx] && m_panels[idx]) m_viewFpsLabels[idx]->setText(m_panels[idx]->fpsLabel->text());
+        if (m_viewFpsLabels[idx]) {
+            if (pkt->instantFps > 0.0) {
+                m_viewFpsLabels[idx]->setText(QString("%1 fps").arg(pkt->instantFps, 0, 'f', 1));
+            } else if (m_panels[idx]) {
+                m_viewFpsLabels[idx]->setText(m_panels[idx]->fpsLabel->text());
+            }
+        }
         if (m_viewStatusLabels[idx] && m_panels[idx]) m_viewStatusLabels[idx]->setText(m_panels[idx]->statusLabel->text());
     }
 
@@ -3089,9 +3605,10 @@ void MainWindow::onParamsQueried(int idx, const CameraParams& params)
         state.height = QString::number(params.height);
 
     state.appliedWidth = QString::number(params.width);
-    state.appliedHeight = QString::number(params.height);
-    state.fps = QString::number(params.fps, 'f', 2);
-    state.exposure = QString::number(params.exposure, 'f', 0);
+    if (params.fps > 0.05f)
+        state.fps = QString::number(params.fps, 'f', 2);
+    if (params.exposure > 0.0f)
+        state.exposure = QString::number(params.exposure, 'f', 0);
     state.gain = QString::number(params.gain, 'f', 1);
     state.testPattern = (params.testPattern == 1 ? "Gray Diagonal Ramp" : "Off");
     if (params.tdiMode >= 0 && params.tdiMode <= 2)
@@ -3220,8 +3737,9 @@ void MainWindow::onTemperatureReady(int idx, float sensor, float grabber)
 
 void MainWindow::onDisplayModeToggled()
 {
-    const bool stretchMode = m_displayModeBtn && m_displayModeBtn->isChecked();
-    m_fitToScreen = !stretchMode;
+    m_fitToScreen = true;
+    m_zoomFactors[0] = 1.0;
+    m_zoomFactors[1] = 1.0;
     setProperty("fitToScreen", m_fitToScreen);
     if (m_displayModeBtn)
         m_displayModeBtn->update();
@@ -3237,15 +3755,14 @@ void MainWindow::onPixelStretchToggled(bool checked)
 
 void MainWindow::onDarkModeToggled()
 {
-    setDarkMode(m_darkModeBtn ? m_darkModeBtn->isChecked() : !m_darkMode);
+    setDarkMode(!m_darkMode);
 }
 
 void MainWindow::setDarkMode(bool dark)
 {
     m_darkMode = dark;
-    if (m_darkModeBtn && m_darkModeBtn->isChecked() != dark) {
-        const QSignalBlocker blocker(m_darkModeBtn);
-        m_darkModeBtn->setChecked(dark);
+    if (m_darkModeBtn) {
+        m_darkModeBtn->setDarkMode(dark);
     }
 
     applyStyles();
@@ -3261,38 +3778,131 @@ void MainWindow::setDarkMode(bool dark)
 
 void MainWindow::applyControlVisibility()
 {
-    if (m_toggleControlsBtn)
-        m_toggleControlsBtn->setText(m_controlsHidden ? " Show Controls " : " Hide Controls ");
-
     const int totalW = std::max(1, width());
-    const int defaultControlsW = 300;
+    const int defaultControlsW = 410;
     const int dualControlW = 480;
     const int controlsW = (m_currentPreset == PresetLayout::DualControl) ? dualControlW : defaultControlsW;
+
+    if (m_collapseBtn) {
+        m_collapseBtn->setText(m_controlsHidden ? QString::fromUtf8("▶") : QString::fromUtf8("◀"));
+        m_collapseBtn->setToolTip(m_controlsHidden ? "Show controls" : "Hide controls");
+    }
 
     switch (m_currentPreset)
     {
     case PresetLayout::SideBySide:
     case PresetLayout::TopBottom:
     case PresetLayout::DualControl:
-        if (m_sidebarScroll)
-            m_sidebarScroll->setVisible(!m_controlsHidden);
-        if (m_mainSplitter)
-            m_mainSplitter->setSizes(
-                m_controlsHidden
-                    ? QList<int>{0, totalW}
-                    : QList<int>{controlsW, std::max(1, totalW - controlsW)});
+        if (m_sidebarContainer) {
+            if (m_controlsHidden) {
+                if (m_sidebarContainer->width() > 100) {
+                    m_lastControlsWidth = m_sidebarContainer->width();
+                }
+                m_sidebarContainer->hide();
+                if (m_mainSplitter)
+                    m_mainSplitter->setSizes({0, totalW});
+            } else {
+                const int minW = (m_currentPreset == PresetLayout::DualControl) ? 440 : 380;
+                m_sidebarContainer->setMinimumWidth(minW);
+                m_sidebarContainer->setMaximumWidth(QWIDGETSIZE_MAX);
+                m_sidebarContainer->show();
+                m_sidebarScroll->show();
+                const int restoreW = std::max(controlsW, m_lastControlsWidth);
+                if (m_mainSplitter)
+                    m_mainSplitter->setSizes({restoreW, std::max(1, totalW - restoreW)});
+            }
+        }
         break;
     case PresetLayout::ControlsTop:
-        if (m_sidebarScroll)
-            m_sidebarScroll->hide();
+        if (m_sidebarContainer)
+            m_sidebarContainer->hide();
         if (m_topControlsHost)
             m_topControlsHost->setVisible(!m_controlsHidden);
         if (m_controlsTopSplitter)
             m_controlsTopSplitter->setSizes(m_controlsHidden ? QList<int>{0, 1080} : QList<int>{150, 930});
         if (m_mainSplitter)
-            m_mainSplitter->setSizes({0, 1920});
+            m_mainSplitter->setSizes({0, totalW});
         break;
     }
+
+    updateCollapseButtonPosition();
+    updateLogButtonPosition();
+}
+
+void MainWindow::updateCollapseButtonPosition()
+{
+    if (!m_collapseBtn || !m_liveTab || !m_mainSplitter) return;
+
+    if (m_currentPreset == PresetLayout::ControlsTop) {
+        m_collapseBtn->hide();
+        return;
+    }
+
+    const int btnW = 16;
+    const int btnH = 52;
+
+    QPoint splitterOrigin = m_mainSplitter->mapTo(m_liveTab, QPoint(0, 0));
+    int splitterH = m_mainSplitter->height();
+    if (splitterH <= 0) splitterH = m_liveTab->height();
+
+    int btnY = splitterOrigin.y() + (splitterH - btnH) / 2;
+    int btnX = 0;
+
+    if (m_controlsHidden || !m_sidebarContainer || !m_sidebarContainer->isVisible() || m_sidebarContainer->width() <= 0) {
+        btnX = splitterOrigin.x();
+    } else {
+        QPoint sidebarOrigin = m_sidebarContainer->mapTo(m_liveTab, QPoint(0, 0));
+        int boundaryX = sidebarOrigin.x() + m_sidebarContainer->width();
+        btnX = boundaryX - (btnW / 2);
+    }
+
+    m_collapseBtn->setGeometry(btnX, btnY, btnW, btnH);
+    m_collapseBtn->show();
+    m_collapseBtn->raise();
+}
+
+void MainWindow::updateLogButtonPosition()
+{
+    if (!m_logCollapseBtn || !m_liveTab || !m_rootSplitter) return;
+
+    m_logCollapseBtn->show();
+    m_logCollapseBtn->raise();
+
+    const int btnW = 52;
+    const int btnH = 16;
+
+    int tabW = m_liveTab->width();
+    int tabH = m_liveTab->height();
+    if (tabW <= 0 || tabH <= 0) return;
+
+    int btnX = (tabW - btnW) / 2;
+    int btnY = 0;
+
+    if (m_logHidden || !m_logContainer || !m_logContainer->isVisible() || m_logContainer->height() <= 0) {
+        btnY = tabH - btnH;
+    } else {
+        QPoint logOrigin = m_logContainer->mapTo(m_liveTab, QPoint(0, 0));
+        int boundaryY = logOrigin.y();
+        btnY = boundaryY - (btnH / 2);
+    }
+
+    m_logCollapseBtn->setGeometry(btnX, btnY, btnW, btnH);
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event)
+{
+    QMainWindow::resizeEvent(event);
+    updateCollapseButtonPosition();
+    updateLogButtonPosition();
+}
+
+void MainWindow::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    QTimer::singleShot(20, this, [this]() {
+        updateCollapseButtonPosition();
+        updateLogButtonPosition();
+    });
 }
 
 void MainWindow::closeEvent(QCloseEvent* e)
@@ -3362,26 +3972,28 @@ void MainWindow::loadSettings()
 
     m_darkMode = general.darkMode;
     if (m_darkModeBtn) {
-        m_darkModeBtn->blockSignals(true);
-        m_darkModeBtn->setChecked(m_darkMode);
-        m_darkModeBtn->blockSignals(false);
+        m_darkModeBtn->setDarkMode(m_darkMode, false);
     }
 
     if (!general.geometry.isEmpty()) restoreGeometry(general.geometry);
     if (!general.windowState.isEmpty()) restoreState(general.windowState);
 
     m_currentPreset = static_cast<PresetLayout>(general.currentPreset);
-    if (m_layoutCombo) {
-        m_layoutCombo->blockSignals(true);
-        m_layoutCombo->setCurrentIndex(general.currentPreset);
-        m_layoutCombo->blockSignals(false);
-    }
+    updateLayoutMenuCheckmark(m_currentPreset);
 
     switch (m_currentPreset) {
         case PresetLayout::TopBottom: applyPresetTopBottom(); break;
         case PresetLayout::DualControl: applyPresetDualControl(); break;
         case PresetLayout::ControlsTop: applyPresetControlsTop(); break;
         default: applyPresetSideBySide(); break;
+    }
+
+    if (m_mainSplitter && m_currentPreset != PresetLayout::ControlsTop && !m_controlsHidden) {
+        int curW = m_mainSplitter->sizes().value(0, 0);
+        if (curW < 380) {
+            int totalW = std::max(1, width());
+            m_mainSplitter->setSizes({410, std::max(1, totalW - 410)});
+        }
     }
 
     if (m_displayModeBtn) {
@@ -3441,7 +4053,7 @@ void MainWindow::resetAllValuesToDefault()
 
     m_darkMode = general.darkMode;
     if (m_darkModeBtn) {
-        m_darkModeBtn->setChecked(m_darkMode);
+        m_darkModeBtn->setDarkMode(m_darkMode);
     }
 
     applyPresetSideBySide();
@@ -3489,15 +4101,52 @@ void MainWindow::resetAllValuesToDefault()
 // ── Auto-detect cameras ───────────────────────────────────────────────
 void MainWindow::detectCameras()
 {
-    if (m_cameraManager) {
-        m_cameraManager->detectHardware();
-    }
+    if (!m_cameraManager) return;
+
+    if (m_detectBtn) m_detectBtn->setEnabled(false);
+    if (m_connectAllBtn) m_connectAllBtn->setEnabled(false);
+    if (m_startAllBtn) m_startAllBtn->setEnabled(false);
+
+    DetectionProgressDialog dlg(this, m_darkMode);
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+
+    QThread* thread = QThread::create([this]() {
+        if (m_cameraManager) {
+            m_cameraManager->detectHardware();
+        }
+    });
+
+    connect(thread, &QThread::finished, &dlg, [&dlg]() {
+        dlg.allowClose();
+    }, Qt::QueuedConnection);
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+
+    thread->start();
+    dlg.exec();
+
+    QApplication::restoreOverrideCursor();
+
+    if (m_detectBtn) m_detectBtn->setEnabled(true);
+    if (m_connectAllBtn) m_connectAllBtn->setEnabled(true);
+    if (m_startAllBtn) m_startAllBtn->setEnabled(true);
 }
 
 // ── Styles ────────────────────────────────────────────────────────────
 void MainWindow::applyStyles()
 {
     ThemeManager::applyTheme(this, m_darkMode);
+
+    if (m_appNameBtn) {
+        m_appNameBtn->setIcon(QIcon(m_darkMode ? ":/resources/icons/logo-white.png"
+                                               : ":/resources/icons/logo-black.png"));
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (auto* vvl = dynamic_cast<VideoViewLabel*>(m_viewLabels[i])) {
+            vvl->setDarkMode(m_darkMode);
+        }
+    }
 
 #ifdef HAS_OFFLINE_VIEWER
     if (m_offlineViewer) {

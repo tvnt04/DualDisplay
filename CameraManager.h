@@ -28,6 +28,7 @@ public:
     QStringList getDetectedCameraNames() const { return m_detectedCameraNames; }
 
     void assignCameraSource(int slot, int detectedIndex);
+    CAMHANDLE camHandle(int idx) const;
 
     bool isConnected(int idx) const;
     bool isStreaming(int idx) const;
@@ -36,6 +37,8 @@ public:
     void disconnectCamera(int idx);
     void startStream(int idx);
     void stopStream(int idx);
+    void startAllStreams();
+    void stopAllStreams();
 
     void applyWorkerParams(int idx, const CameraParams& params);
     void setLiveFps(int idx, double fps);
