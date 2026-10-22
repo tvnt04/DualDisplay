@@ -13,6 +13,39 @@
 #include "KYFGLibA.h"
 #endif
 
+class HardwareWorker : public QObject
+{
+    Q_OBJECT
+public:
+    explicit HardwareWorker(QObject* parent = nullptr) : QObject(parent) {}
+    ~HardwareWorker() override = default;
+
+    int detectedCameraCount() const { return m_detectedCameraCount; }
+    QStringList detectedCameraNames() const { return m_detectedCameraNames; }
+#if !USING_STUB
+    CAMHANDLE detectedCamHandle(int i) const { return (i >= 0 && i < KY_MAX_CAMERAS) ? m_detectedCamHandles[i] : INVALID_CAMHANDLE; }
+    FGHANDLE detectedCamFg(int i) const { return (i >= 0 && i < KY_MAX_CAMERAS) ? m_detectedCamFgs[i] : INVALID_FGHANDLE; }
+    std::vector<FGHANDLE> fgHandles() const { return m_fgHandles; }
+#endif
+
+public slots:
+    void doDetectHardware();
+    void doCloseHardware();
+
+signals:
+    void hardwareDetected(int count, const QStringList& names);
+    void statusMessage(const QString& msg, int timeoutMs);
+
+private:
+#if !USING_STUB
+    std::vector<FGHANDLE> m_fgHandles;
+    CAMHANDLE             m_detectedCamHandles[KY_MAX_CAMERAS] = {};
+    FGHANDLE              m_detectedCamFgs[KY_MAX_CAMERAS] = {};
+#endif
+    int                   m_detectedCameraCount = 0;
+    QStringList           m_detectedCameraNames;
+};
+
 class CameraManager : public QObject
 {
     Q_OBJECT
@@ -28,6 +61,7 @@ public:
     QStringList getDetectedCameraNames() const { return m_detectedCameraNames; }
 
     void assignCameraSource(int slot, int detectedIndex);
+    CAMHANDLE camHandle(int idx) const;
 
     bool isConnected(int idx) const;
     bool isStreaming(int idx) const;
@@ -36,6 +70,8 @@ public:
     void disconnectCamera(int idx);
     void startStream(int idx);
     void stopStream(int idx);
+    void startAllStreams();
+    void stopAllStreams();
 
     void applyWorkerParams(int idx, const CameraParams& params);
     void setLiveFps(int idx, double fps);
@@ -73,12 +109,16 @@ private slots:
     void onWorkerErrorOccurred(int idx, const QString& msg);
     void onWorkerTemperatureReady(int idx, float sensor, float grabber);
     void onWorkerFpsClamped(int idx, double requestedFps, double maxFps);
+    void onHardwareDetected(int count, const QStringList& cameraNames);
 
 private:
-    CameraWorker* m_workers[2] = {nullptr, nullptr};
-    QThread*      m_workerThreads[2] = {nullptr, nullptr};
-    bool          m_connected[2] = {false, false};
-    bool          m_streaming[2] = {false, false};
+    CameraWorker*   m_workers[2] = {nullptr, nullptr};
+    QThread*        m_workerThreads[2] = {nullptr, nullptr};
+    bool            m_connected[2] = {false, false};
+    bool            m_streaming[2] = {false, false};
+
+    QThread*        m_hardwareThread = nullptr;
+    HardwareWorker* m_hardwareWorker = nullptr;
 
 #if !USING_STUB
     std::vector<FGHANDLE> m_fgHandles;

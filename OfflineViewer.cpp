@@ -203,6 +203,104 @@ OfflineViewer::OfflineViewer(QWidget* parent)
     m_offlineAnalysisBtn->setCheckable(true);
     offlineTbLayout->addWidget(m_offlineAnalysisBtn);
 
+    offlineTbLayout->addSpacing(15);
+
+    QFrame* dispCap = new QFrame(offlineTopToolbar);
+    dispCap->setObjectName("capsuleGroup");
+    QHBoxLayout* dispCapLay = new QHBoxLayout(dispCap);
+    dispCapLay->setContentsMargins(6, 2, 6, 2);
+    dispCapLay->setSpacing(4);
+
+    QLabel* dispLabel = new QLabel("Display:", dispCap);
+    dispLabel->setObjectName("capsuleLabel");
+    dispCapLay->addWidget(dispLabel);
+
+    m_offlineFitBtn = new QPushButton("Fit", dispCap);
+    m_offlineFitBtn->setObjectName("capsuleBtn");
+    m_offlineFitBtn->setCheckable(true);
+    m_offlineFitBtn->setChecked(true);
+    m_offlineFitBtn->setToolTip("Fit to screen");
+    dispCapLay->addWidget(m_offlineFitBtn);
+
+    m_offlineActualBtn = new QPushButton("1:1", dispCap);
+    m_offlineActualBtn->setObjectName("capsuleBtn");
+    m_offlineActualBtn->setToolTip("Actual size (100%)");
+    dispCapLay->addWidget(m_offlineActualBtn);
+
+    m_offlineZoomOutBtn = new QPushButton("－", dispCap);
+    m_offlineZoomOutBtn->setObjectName("capsuleBtn");
+    m_offlineZoomOutBtn->setToolTip("Zoom Out");
+    dispCapLay->addWidget(m_offlineZoomOutBtn);
+
+    m_offlineZoomLabel = new QLabel("100%", dispCap);
+    m_offlineZoomLabel->setObjectName("capsuleLabel");
+    m_offlineZoomLabel->setAlignment(Qt::AlignCenter);
+    m_offlineZoomLabel->setFixedWidth(38);
+    dispCapLay->addWidget(m_offlineZoomLabel);
+
+    m_offlineZoomInBtn = new QPushButton("＋", dispCap);
+    m_offlineZoomInBtn->setObjectName("capsuleBtn");
+    m_offlineZoomInBtn->setToolTip("Zoom In");
+    dispCapLay->addWidget(m_offlineZoomInBtn);
+
+    dispCapLay->addSpacing(4);
+
+    m_offlineContrastBtn = new QPushButton("Contrast: OFF", dispCap);
+    m_offlineContrastBtn->setObjectName("capsuleBtn");
+    m_offlineContrastBtn->setCheckable(true);
+    m_offlineContrastBtn->setChecked(false);
+    m_offlineContrastBtn->setToolTip("Stretch pixel contrast across full dynamic range (Toggle ON/OFF)");
+    dispCapLay->addWidget(m_offlineContrastBtn);
+
+    offlineTbLayout->addWidget(dispCap);
+
+    auto updateZoomLabel = [this]() {
+        if (m_offlineZoomLabel) {
+            int pct = qRound(m_zoomFactor * 100.0);
+            m_offlineZoomLabel->setText(QString("%1%").arg(pct));
+        }
+    };
+
+    connect(m_offlineFitBtn, &QPushButton::clicked, this, [this, updateZoomLabel]() {
+        m_fitToScreen = true;
+        m_zoomFactor = 1.0;
+        m_offlineFitBtn->setChecked(true);
+        updateZoomLabel();
+        onDisplaySettingsChanged();
+    });
+
+    connect(m_offlineActualBtn, &QPushButton::clicked, this, [this, updateZoomLabel]() {
+        m_fitToScreen = false;
+        m_zoomFactor = 1.0;
+        m_offlineFitBtn->setChecked(false);
+        updateZoomLabel();
+        onDisplaySettingsChanged();
+    });
+
+    connect(m_offlineZoomInBtn, &QPushButton::clicked, this, [this, updateZoomLabel]() {
+        m_zoomFactor = std::min(8.0, m_zoomFactor * 1.25);
+        m_fitToScreen = false;
+        m_offlineFitBtn->setChecked(false);
+        updateZoomLabel();
+        onDisplaySettingsChanged();
+    });
+
+    connect(m_offlineZoomOutBtn, &QPushButton::clicked, this, [this, updateZoomLabel]() {
+        m_zoomFactor = std::max(0.125, m_zoomFactor / 1.25);
+        m_fitToScreen = false;
+        m_offlineFitBtn->setChecked(false);
+        updateZoomLabel();
+        onDisplaySettingsChanged();
+    });
+
+    connect(m_offlineContrastBtn, &QPushButton::toggled, this, [this](bool checked) {
+        m_pixelContrast = checked;
+        m_offlineContrastBtn->setText(checked ? "Contrast: ON" : "Contrast: OFF");
+        onDisplaySettingsChanged();
+    });
+
+    offlineTbLayout->addStretch(1);
+
     QLabel* lightThemeLabel = new QLabel("Light", offlineTopToolbar);
     lightThemeLabel->setObjectName("modeSideLabel");
     offlineTbLayout->addWidget(lightThemeLabel);
@@ -219,7 +317,6 @@ OfflineViewer::OfflineViewer(QWidget* parent)
     darkThemeLabel->setObjectName("modeSideLabel");
     offlineTbLayout->addWidget(darkThemeLabel);
 
-    offlineTbLayout->addStretch(1);
     offlineTabLayout->addWidget(offlineTopToolbar);
 
     // ── Create image view container first ────────────────────────────────────
@@ -256,8 +353,6 @@ OfflineViewer::OfflineViewer(QWidget* parent)
     // Default sizes: give image ~65%, graph ~35% of total height
     // (graph is hidden initially so these only matter once it's shown)
     m_viewGraphSplitter->setSizes({600, 280});
-
-    offlineTabLayout->addWidget(m_viewGraphSplitter, 1);
 
     connect(m_offlineAnalysisBtn, &QPushButton::toggled, this, [this](bool checked) {
         if (m_analysisPanel) {
@@ -331,6 +426,9 @@ OfflineViewer::OfflineViewer(QWidget* parent)
         m_offlineViewLabels[i]->setMouseTracking(true);
         m_offlineViewScrolls[i]->setWidget(m_offlineViewLabels[i]);
         m_offlineViewScrolls[i]->setWidgetResizable(true);
+        m_offlineViewScrolls[i]->installEventFilter(this);
+        if (m_offlineViewScrolls[i]->viewport())
+            m_offlineViewScrolls[i]->viewport()->installEventFilter(this);
         vl->addWidget(m_offlineViewScrolls[i], 1);
 
         m_offlineViewStatusLabels[i] = new QLabel("Playback stopped", m_offlineViewWidgets[i]);
@@ -361,6 +459,7 @@ OfflineViewer::OfflineViewer(QWidget* parent)
     }
     m_offlineHost = new QWidget(this);
     m_offlineHost->setObjectName("offlineHost");
+    m_offlineHost->setFixedHeight(44);
     m_offlineHostLayout = new QHBoxLayout(m_offlineHost);
     m_offlineHostLayout->setContentsMargins(8, 8, 8, 8);
     m_offlineHostLayout->setSpacing(8);
@@ -463,16 +562,33 @@ OfflineViewer::OfflineViewer(QWidget* parent)
         }
     });
 
-    offlineTabLayout->addWidget(m_offlineHost);
+    QWidget* offlineContent = new QWidget(this);
+    offlineContent->setObjectName("offlineContent");
+    QVBoxLayout* offlineContentLayout = new QVBoxLayout(offlineContent);
+    offlineContentLayout->setContentsMargins(0, 0, 0, 0);
+    offlineContentLayout->setSpacing(0);
+    offlineContentLayout->addWidget(m_viewGraphSplitter, 1);
+    offlineContentLayout->addWidget(m_offlineHost, 0);
 
-    m_offlineLogTerminal = new QPlainTextEdit(this);
+    m_offlineRootSplitter = new QSplitter(Qt::Vertical, this);
+    m_offlineRootSplitter->setObjectName("offlineRootSplitter");
+    m_offlineRootSplitter->setChildrenCollapsible(false);
+    m_offlineRootSplitter->setHandleWidth(4);
+
+    m_offlineLogTerminal = new QPlainTextEdit(m_offlineRootSplitter);
     m_offlineLogTerminal->setObjectName("logTerminal");
     m_offlineLogTerminal->setReadOnly(true);
     m_offlineLogTerminal->setMaximumBlockCount(2000);
     m_offlineLogTerminal->setPlaceholderText("Offline Runtime logs...");
-    m_offlineLogTerminal->setMinimumHeight(72);
-    m_offlineLogTerminal->setMaximumHeight(96);
-    offlineTabLayout->addWidget(m_offlineLogTerminal);
+    m_offlineLogTerminal->setMinimumHeight(35);
+
+    m_offlineRootSplitter->addWidget(offlineContent);
+    m_offlineRootSplitter->addWidget(m_offlineLogTerminal);
+    m_offlineRootSplitter->setStretchFactor(0, 1);
+    m_offlineRootSplitter->setStretchFactor(1, 0);
+    m_offlineRootSplitter->setSizes({880, 100});
+
+    offlineTabLayout->addWidget(m_offlineRootSplitter, 1);
 
     QWidget* mw = parentWidget();
     while (mw) {
@@ -1489,9 +1605,42 @@ void OfflineViewer::renderOfflineFrame(int idx, const QByteArray& pixels, int wi
         return;
     }
 
+    // Apply Pixel Contrast (Stretch min/max across full dynamic range) if enabled
+    const uchar* srcData = reinterpret_cast<const uchar*>(pixels.constData());
+    if (m_pixelContrast && expectedBytes > 0) {
+        uint8_t mn = 255;
+        uint8_t mx = 0;
+        const qint64 sampleStride = 32;
+        for (qint64 k = 0; k < expectedBytes; k += sampleStride) {
+            uint8_t val = srcData[k];
+            if (val < mn) mn = val;
+            if (val > mx) mx = val;
+            if (mn == 0 && mx == 255) break;
+        }
+        if (mn < mx && !(mn == 0 && mx == 255)) {
+            uint8_t lut[256];
+            const float s = 255.0f / static_cast<float>(mx - mn);
+            for (int v = 0; v < 256; ++v) {
+                if (v <= mn) lut[v] = 0;
+                else if (v >= mx) lut[v] = 255;
+                else lut[v] = static_cast<uint8_t>((v - mn) * s + 0.5f);
+            }
+
+            if (m_contrastBuffer[idx].size() != static_cast<size_t>(expectedBytes)) {
+                m_contrastBuffer[idx].resize(expectedBytes);
+            }
+            uint8_t* dst = m_contrastBuffer[idx].data();
+
+            #pragma omp parallel for schedule(static)
+            for (qint64 k = 0; k < expectedBytes; ++k) {
+                dst[k] = lut[srcData[k]];
+            }
+            srcData = dst;
+        }
+    }
+
     // Always build the full-width image for display (panoramic merged view unchanged)
-    QImage img(reinterpret_cast<const uchar*>(pixels.constData()),
-               width, height, width, QImage::Format_Grayscale8);
+    QImage img(srcData, width, height, width, QImage::Format_Grayscale8);
     if (img.isNull()) {
         m_offlineViewLabels[idx]->setText("No valid frame loaded");
         return;
@@ -1564,27 +1713,31 @@ void OfflineViewer::renderOfflineFrame(int idx, const QByteArray& pixels, int wi
     }
 
     QPixmap px;
-
-    bool fitToScreen = true;
-    QWidget* mw = parentWidget();
-    while (mw) {
-        if (auto* qmw = qobject_cast<QMainWindow*>(mw)) {
-            fitToScreen = qmw->property("fitToScreen").toBool();
-            break;
+    if (m_fitToScreen && m_zoomFactor == 1.0) {
+        QSize targetSize;
+        if (m_offlineViewScrolls[idx] && m_offlineViewScrolls[idx]->viewport()) {
+            targetSize = m_offlineViewScrolls[idx]->viewport()->size();
         }
-        mw = mw->parentWidget();
-    }
-
-    if (fitToScreen && m_offlineViewScrolls[idx]) {
-        QSize targetSize = m_offlineViewScrolls[idx]->viewport()->size();
         if (targetSize.isValid() && !targetSize.isEmpty()) {
-            QImage scaledImg = displayImg.scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            QImage scaledImg = displayImg.scaled(targetSize, Qt::KeepAspectRatio, Qt::FastTransformation);
             px = QPixmap::fromImage(scaledImg);
         } else {
             px = QPixmap::fromImage(displayImg);
         }
     } else {
-        px = QPixmap::fromImage(displayImg);
+        QSize baseSize;
+        if (m_fitToScreen && m_offlineViewScrolls[idx] && m_offlineViewScrolls[idx]->viewport() && !m_offlineViewScrolls[idx]->viewport()->size().isEmpty()) {
+            baseSize = displayImg.scaled(m_offlineViewScrolls[idx]->viewport()->size(), Qt::KeepAspectRatio, Qt::FastTransformation).size();
+        } else {
+            baseSize = QSize(width, height);
+        }
+        QSize targetSize = baseSize * m_zoomFactor;
+        if (targetSize.width() > 0 && targetSize.height() > 0) {
+            QImage scaledImg = displayImg.scaled(targetSize, Qt::KeepAspectRatio, Qt::FastTransformation);
+            px = QPixmap::fromImage(scaledImg);
+        } else {
+            px = QPixmap::fromImage(displayImg);
+        }
     }
 
     m_offlineViewLabels[idx]->setPixmap(px);
@@ -1692,6 +1845,30 @@ bool OfflineViewer::eventFilter(QObject* watched, QEvent* event)
             }
         }
     }
+
+    if (event->type() == QEvent::Wheel) {
+        if (watched == m_offlineViewScrolls[0] || watched == m_offlineViewScrolls[1] ||
+            (m_offlineViewScrolls[0] && watched == m_offlineViewScrolls[0]->viewport()) ||
+            (m_offlineViewScrolls[1] && watched == m_offlineViewScrolls[1]->viewport())) {
+            auto* we = static_cast<QWheelEvent*>(event);
+            if (we->modifiers() & Qt::ControlModifier) {
+                if (we->angleDelta().y() > 0) {
+                    if (m_offlineZoomInBtn) m_offlineZoomInBtn->click();
+                } else if (we->angleDelta().y() < 0) {
+                    if (m_offlineZoomOutBtn) m_offlineZoomOutBtn->click();
+                }
+                return true;
+            }
+        }
+    }
+
+    if (event->type() == QEvent::Resize && m_fitToScreen && m_zoomFactor == 1.0) {
+        if ((m_offlineViewScrolls[0] && watched == m_offlineViewScrolls[0]->viewport()) ||
+            (m_offlineViewScrolls[1] && watched == m_offlineViewScrolls[1]->viewport())) {
+            onDisplaySettingsChanged();
+        }
+    }
+
     return QWidget::eventFilter(watched, event);
 }
 

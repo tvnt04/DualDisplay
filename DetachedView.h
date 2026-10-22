@@ -8,6 +8,7 @@
 
 #include <QWidget>
 #include <QLabel>
+#include "VideoViewLabel.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -68,11 +69,8 @@ public:
         root->addWidget(bar);
 
         // ── Image label ──────────────────────────────────────────────
-        m_imageLabel = new QLabel("No Signal");
+        m_imageLabel = new VideoViewLabel();
         m_imageLabel->setAlignment(Qt::AlignCenter);
-        m_imageLabel->setStyleSheet(
-            "color:#2a3a58; font-size:22px; font-weight:bold;"
-            "font-family:'Courier New',monospace; background:#060810;");
         root->addWidget(m_imageLabel, 1);
     }
 

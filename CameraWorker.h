@@ -45,6 +45,7 @@ struct FramePacket {
     int   cameraIndex    = 0;
     int   packedMin      = 0;
     int   packedMax      = 0;
+    double instantFps    = 0.0;
     qint64 timestampMs   = 0;
 };
 
@@ -161,8 +162,10 @@ private:
     void endStreamCallback();
     void stopAcceptingStreamCallbacks();
     bool applyCameraParameters(bool includeGeometry);
+    void restartStreamAfterLiveUpdate(bool wasStreaming);
     CameraParams queryCameraParameters();
     size_t queryActualPayloadSize() const;
+    void cleanupCameraLocked();
 
     // ── Real hardware members ──────────────────────────────────────────
     STREAM_HANDLE       m_streamHandle = INVALID_STREAMHANDLE;

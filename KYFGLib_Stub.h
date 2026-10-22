@@ -83,6 +83,7 @@ inline KYFGSTATUS KYFG_StreamGetInfo(STREAM_HANDLE, int key, void* out, void*, v
     return FGSTATUS_OK;
 }
 inline KYFGSTATUS KYFG_BufferAnnounce(STREAM_HANDLE, void*, size_t, void*, STREAM_BUFFER_HANDLE* h) { if (h) *h = 1; return FGSTATUS_OK; }
+inline KYFGSTATUS KYFG_BufferRevoke(STREAM_HANDLE, STREAM_BUFFER_HANDLE) { return FGSTATUS_OK; }
 inline KYFGSTATUS KYFG_BufferQueueAll(STREAM_HANDLE, int, int)  { return FGSTATUS_OK; }
 inline KYFGSTATUS KYFG_BufferToQueue(STREAM_BUFFER_HANDLE, int) { return FGSTATUS_OK; }
 inline KYFGSTATUS KYFG_BufferGetInfo(STREAM_BUFFER_HANDLE, int, void*, void*, void*) { return FGSTATUS_OK; }

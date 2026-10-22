@@ -147,8 +147,10 @@ void SettingsManager::loadSettings(GeneralAppSettings& general,
 
         state.width = getValue(group, "width", "9344", legPfx + "width").toString();
         state.height = getValue(group, "height", "3840", legPfx + "height").toString();
-        state.fps = getValue(group, "fps", "1.0", legPfx + "fps").toString();
-        state.exposure = getValue(group, "exposure", "29999", legPfx + "exposure").toString();
+        state.fps = getValue(group, "fps", "10.0", legPfx + "fps").toString();
+        if (state.fps.toFloat() <= 0.05f) state.fps = "10.00";
+        state.exposure = getValue(group, "exposure", "5000", legPfx + "exposure").toString();
+        if (state.exposure.toFloat() < 100.0f) state.exposure = "5000";
         state.gain = getValue(group, "gain", "1.0", legPfx + "gain").toString();
         state.testPattern = getValue(group, "testPattern", "Off", legPfx + "testPattern").toString();
         state.tdiMode = getValue(group, "tdiMode", "Off", legPfx + "tdiMode").toString();

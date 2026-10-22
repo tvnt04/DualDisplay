@@ -1,0 +1,10 @@
+<RCC>
+    <qresource prefix="/">
+        <file>resources/icons/logo-white.png</file>
+        <file>resources/icons/logo-black.png</file>
+        <file>resources/icons/logo-white-square.png</file>
+        <file>resources/icons/logo-black-square.png</file>
+        <file>resources/icons/app-icon.png</file>
+    </qresource>
+</RCC>
+

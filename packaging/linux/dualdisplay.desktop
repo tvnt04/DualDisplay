@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=DualDisplay
-Comment=DualDisplay camera analysis application
+Name=XDLINX Display Tool
+Comment=XDLINX Display Tool for dual-camera viewing and analysis
 Exec=AppRun
-Icon=DualDisplay
+Icon=xdt
 Terminal=false
 Categories=Utility;
 StartupNotify=true

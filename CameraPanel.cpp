@@ -80,22 +80,57 @@ CameraPanel::CameraPanel(int camIndex, QWidget* parent)
     saveModeCombo->addItems({"Sequence", "Single File"});
     saveModeCombo->setCurrentText("Single File");
 
-    stopAfterDurationCheck = new QCheckBox("Enable stop after duration");
-    saveDurationEdit = new QLineEdit("5.0");
-    saveDurationEdit->setPlaceholderText("Seconds");
-    saveDurationEdit->setEnabled(false);
-    connect(stopAfterDurationCheck, &QCheckBox::toggled,
-            saveDurationEdit, &QLineEdit::setEnabled);
+    saveDurationSlider = new QSlider(Qt::Horizontal);
+    saveDurationSlider->setRange(0, 4);
+    saveDurationSlider->setSingleStep(1);
+    saveDurationSlider->setPageStep(1);
+    saveDurationSlider->setTickInterval(1);
+    saveDurationSlider->setTickPosition(QSlider::TicksBelow);
+    saveDurationSlider->setValue(1);
+
+    saveDurationSpin = new QDoubleSpinBox();
+    saveDurationSpin->setRange(0.0, 3600.0);
+    saveDurationSpin->setSingleStep(1.0);
+    saveDurationSpin->setDecimals(1);
+    saveDurationSpin->setSuffix(" s");
+    saveDurationSpin->setSpecialValueText("Off");
+    saveDurationSpin->setValue(5.0);
+
+    connect(saveDurationSlider, &QSlider::valueChanged, this, [this](int val) {
+        double d = 0.0;
+        if (val == 1) d = 5.0;
+        else if (val == 2) d = 10.0;
+        else if (val == 3) d = 15.0;
+        else if (val == 4) d = customLastDuration;
+        saveDurationSpin->blockSignals(true);
+        saveDurationSpin->setValue(d);
+        saveDurationSpin->blockSignals(false);
+    });
+
+    connect(saveDurationSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double val) {
+        int idx = 0;
+        if (val <= 0.0) idx = 0;
+        else if (std::abs(val - 5.0) < 0.25) idx = 1;
+        else if (std::abs(val - 10.0) < 0.25) idx = 2;
+        else if (std::abs(val - 15.0) < 0.25) idx = 3;
+        else {
+            customLastDuration = val;
+            idx = 4;
+        }
+        saveDurationSlider->blockSignals(true);
+        saveDurationSlider->setValue(idx);
+        saveDurationSlider->blockSignals(false);
+    });
 
     QWidget* durationRow = new QWidget();
     QHBoxLayout* durationRowLayout = new QHBoxLayout(durationRow);
     durationRowLayout->setContentsMargins(0, 0, 0, 0);
-    durationRowLayout->setSpacing(4);
-    durationRowLayout->addWidget(stopAfterDurationCheck);
-    durationRowLayout->addWidget(saveDurationEdit, 1);
+    durationRowLayout->setSpacing(6);
+    durationRowLayout->addWidget(saveDurationSlider, 1);
+    durationRowLayout->addWidget(saveDurationSpin);
 
     form->addRow("Save Mode:", saveModeCombo);
-    form->addRow("Stop After (s):", durationRow);
+    form->addRow("Timer (s):", durationRow);
 
     widthEdit       = new QLineEdit("9344");
     heightEdit      = new QLineEdit("3840");
@@ -296,13 +331,14 @@ void CameraPanel::setSaving(bool v)
     if (saveModeCombo) saveModeCombo->setEnabled(!v);
     if (savePathEdit) savePathEdit->setEnabled(!v);
     if (browseRawBtn) browseRawBtn->setEnabled(!v);
-    if (stopAfterDurationCheck) stopAfterDurationCheck->setEnabled(!v);
-    if (saveDurationEdit) saveDurationEdit->setEnabled(!v && stopAfterDurationCheck && stopAfterDurationCheck->isChecked());
+    if (saveDurationSlider) saveDurationSlider->setEnabled(!v);
+    if (saveDurationSpin) saveDurationSpin->setEnabled(!v);
 }
 
 void CameraPanel::setAcquisitionFps(double fps)
 {
     m_acquisitionFps = std::max(0.0, fps);
+    lastFps = m_acquisitionFps;
     fpsLabel->setText(m_acquisitionFps > 0.0
         ? QString("%1 fps").arg(m_acquisitionFps, 0, 'f', 1)
         : "— fps");
@@ -414,16 +450,24 @@ bool CameraPanel::updateFrame(const FramePacket& pkt, bool fitToScreen, bool str
 
 void CameraPanel::updateFrameInfo(const FramePacket& pkt, const std::vector<uint8_t>& pixels)
 {
-    ++m_fpsFrameCount;
-    qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (m_fpsLastMs == 0) m_fpsLastMs = now;
-    if (now - m_fpsLastMs >= 1000)
+    if (pkt.instantFps > 0.0)
     {
-        lastFps = m_fpsFrameCount * 1000.0 / (now - m_fpsLastMs);
-        if (m_acquisitionFps <= 0.0)
-            fpsLabel->setText(QString("%1 fps").arg(lastFps, 0, 'f', 1));
-        m_fpsFrameCount = 0;
-        m_fpsLastMs = now;
+        lastFps = pkt.instantFps;
+        fpsLabel->setText(QString("%1 fps").arg(pkt.instantFps, 0, 'f', 1));
+    }
+    else
+    {
+        ++m_fpsFrameCount;
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_fpsLastMs == 0) m_fpsLastMs = now;
+        if (now - m_fpsLastMs >= 1000)
+        {
+            lastFps = m_fpsFrameCount * 1000.0 / (now - m_fpsLastMs);
+            if (m_acquisitionFps <= 0.0)
+                fpsLabel->setText(QString("%1 fps").arg(lastFps, 0, 'f', 1));
+            m_fpsFrameCount = 0;
+            m_fpsLastMs = now;
+        }
     }
 
     static int statsCounter[2] = {0, 0};
@@ -432,30 +476,36 @@ void CameraPanel::updateFrameInfo(const FramePacket& pkt, const std::vector<uint
     if (statsCounter[idx] >= 15 || pkt.frameId < 5)
     {
         statsCounter[idx] = 0;
-        const int minPixel = pixels.empty()
-            ? 0
-            : static_cast<int>(*std::min_element(pixels.begin(), pixels.end()));
-        const int maxPixel = pixels.empty()
-            ? 0
-            : static_cast<int>(*std::max_element(pixels.begin(), pixels.end()));
+        const size_t nPixels = pixels.size();
+        const size_t stride = (nPixels > 50000) ? (nPixels / 50000) : 1;
+        int minPixel = 255;
+        int maxPixel = 0;
+        double sum = 0.0;
+        double sumSq = 0.0;
+        size_t count = 0;
 
-        double meanPixel = 0.0;
-        double variance = 0.0;
-        double sdPixel = 0.0;
-        if (!pixels.empty())
+        if (nPixels > 0)
         {
-            double sum = 0.0;
-            double sumSq = 0.0;
-            for (uint8_t value : pixels)
+            for (size_t k = 0; k < nPixels; k += stride)
             {
-                sum += value;
-                sumSq += double(value) * double(value);
+                uint8_t val = pixels[k];
+                if (val < minPixel) minPixel = val;
+                if (val > maxPixel) maxPixel = val;
+                sum += val;
+                sumSq += double(val) * double(val);
+                count++;
             }
-            meanPixel = sum / pixels.size();
-            variance = (sumSq / pixels.size()) - (meanPixel * meanPixel);
-            if (variance < 0.0) variance = 0.0;
-            sdPixel = std::sqrt(variance);
         }
+        else
+        {
+            minPixel = 0;
+            maxPixel = 0;
+        }
+
+        double meanPixel = count > 0 ? (sum / count) : 0.0;
+        double variance = count > 0 ? ((sumSq / count) - (meanPixel * meanPixel)) : 0.0;
+        if (variance < 0.0) variance = 0.0;
+        double sdPixel = std::sqrt(variance);
 
         lastBrightestPixel = maxPixel;
         statusLabel->setText(QString("Size: %1 x %2  |  Frame: %3  |  Min: %4  |  Max: %5  |  Mean: %6  |  SD: %7  |  Var: %8")
@@ -509,7 +559,9 @@ CameraParams CameraPanel::collectParams() const
     p.width          = widthEdit->text().toInt();
     p.height         = heightEdit->text().toInt();
     p.fps            = fpsEdit->text().toFloat();
+    if (p.fps <= 0.05f) p.fps = 10.0f;
     p.exposure       = exposureEdit->text().toFloat();
+    if (p.exposure < 100.0f) p.exposure = 5000.0f;
     p.gain           = gainEdit->text().toFloat();
     p.testPattern    = testPatternCombo->currentIndex();
     p.tdiMode        = tdiModeCombo->currentIndex();

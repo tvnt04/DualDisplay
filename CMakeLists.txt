@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.14)
-project(DualDisplay VERSION 1.4.1 LANGUAGES CXX)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/AppVersion.h" _APP_VER_LINE REGEX "^#define[ \t]+APP_VERSION[ \t]+\"")
+if(_APP_VER_LINE MATCHES "\"([0-9.]+)\"")
+    set(APP_VERSION_EXTRACTED "${CMAKE_MATCH_1}")
+else()
+    set(APP_VERSION_EXTRACTED "1.0.0")
+endif()
+
+project(XDT VERSION ${APP_VERSION_EXTRACTED} LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
@@ -30,9 +38,10 @@ endif()
 
 set(SOURCES
     main.cpp
+    AppVersion.h
     CameraWorker.h CameraWorker.cpp AlignedMemory.h NativeFile.h
     CameraPanel.h CameraPanel.cpp
-    DetachedView.h
+    DetachedView.h VideoViewLabel.h ThemeToggleSwitch.h
     MergeSaver.h MergeSaver.cpp
     AnalysisPanelWidget.h AnalysisPanelWidget.cpp
     ThemeManager.h ThemeManager.cpp
@@ -42,6 +51,7 @@ set(SOURCES
     CaptureController.h CaptureController.cpp
     CameraManager.h CameraManager.cpp
     MainWindow.h MainWindow.cpp
+    resources.qrc
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/OfflineViewer.cpp")
@@ -50,6 +60,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/OfflineViewer.cpp")
 endif()
 
 add_executable(${PROJECT_NAME} ${SOURCES})
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME xdt)
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     $<$<NOT:$<BOOL:${USING_STUB}>>:${KYFGLIB_INCLUDE_DIR}>

@@ -90,12 +90,15 @@ void CameraWorker::processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBuffer
 
     // Safely discard frame if this buffer belongs to an older/recreated stream session,
     // or if we've stopped streaming or closed the camera.
-    if (epoch != m_streamEpoch.load() || !m_streaming || !m_cameraOpened || m_streamHandle == INVALID_STREAMHANDLE)
+    if (epoch != m_streamEpoch.load() || !m_streaming || !m_cameraOpened || m_streamHandle == INVALID_STREAMHANDLE) {
         return;
+    }
 
     try {
         if (!pFrameMem) {
-            KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
+            if (epoch == m_streamEpoch.load() && m_streaming && m_streamHandle != INVALID_STREAMHANDLE) {
+                KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
+            }
             return;
         }
 
@@ -126,6 +129,7 @@ void CameraWorker::processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBuffer
         pkt->width       = m_params.width;
         pkt->height      = m_params.height;
         pkt->frameId     = m_frameId++;
+        pkt->instantFps  = instantFps;
         pkt->timestampMs = QDateTime::currentMSecsSinceEpoch();
 
         const size_t deliveredSize = (m_actualPayloadSize > 0)
@@ -133,6 +137,11 @@ void CameraWorker::processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBuffer
             : bufferSize;
         if (pFrameMemory && deliveredSize > 0)
             pkt->rawData.assign(pFrameMemory, pFrameMemory + deliveredSize);
+
+        if (pkt->frameId == 0) {
+            emit logMessage(QString("[Cam%1] >>> Grabber callback delivered first frame (buffer size: %2 bytes)")
+                .arg(m_camIndex).arg(deliveredSize));
+        }
 
         emit frameReady(pkt);
     }
@@ -143,14 +152,11 @@ void CameraWorker::processFrame(quint64 epoch, STREAM_BUFFER_HANDLE streamBuffer
         emit logMessage(QString("[Cam%1] Unknown exception in processFrame").arg(m_camIndex));
     }
 
-    try {
-        KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
-    }
-    catch (const std::exception& e) {
-        emit logMessage(QString("[Cam%1] Exception returning buffer to queue: %2").arg(m_camIndex).arg(e.what()));
-    }
-    catch (...) {
-        emit logMessage(QString("[Cam%1] Unknown exception returning buffer to queue").arg(m_camIndex));
+    if (epoch == m_streamEpoch.load() && m_streaming && m_streamHandle != INVALID_STREAMHANDLE) {
+        try {
+            KYFG_BufferToQueue(streamBufferHandle, KY_ACQ_QUEUE_INPUT);
+        }
+        catch (...) {}
     }
 }
 
@@ -158,57 +164,6 @@ void CameraWorker::setParams(const CameraParams& p)
 {
     QMutexLocker lk(&m_mutex);
     m_params = p;
-
-    if (m_cameraOpened && m_camHandle != INVALID_CAMHANDLE)
-    {
-        if (m_streaming)
-        {
-            try {
-                KYFG_CameraStop(m_camHandle);
-                applyCameraParameters(true);
-                m_paramsApplied = true;
-                if (m_streamHandle != INVALID_STREAMHANDLE)
-                {
-                    const size_t actualPayloadSize = queryActualPayloadSize();
-                    if (actualPayloadSize > m_frameDataSize)
-                    {
-                        m_streamReopenRequired = true;
-                        m_actualPayloadSize = m_frameDataSize;
-                        m_streaming = false;
-                        emit errorOccurred(m_camIndex,
-                            QString("Camera %1 payload grew to %2 bytes, exceeding the current %3-byte stream buffers; disconnect and reconnect after changing geometry/TDI.")
-                                .arg(m_camIndex).arg(actualPayloadSize).arg(m_frameDataSize));
-                        emit streamStopped(m_camIndex);
-                        return;
-                    }
-                    m_actualPayloadSize = actualPayloadSize;
-                    KYFG_BufferQueueAll(m_streamHandle, KY_ACQ_QUEUE_UNQUEUED, KY_ACQ_QUEUE_INPUT);
-                    KYFG_CameraStart(m_camHandle, m_streamHandle, 0);
-                }
-            } catch (...) {}
-        }
-        else
-        {
-            applyCameraParameters(true);
-            m_paramsApplied = true;
-            if (m_streamHandle != INVALID_STREAMHANDLE)
-            {
-                const size_t actualPayloadSize = queryActualPayloadSize();
-                if (actualPayloadSize > m_frameDataSize)
-                {
-                    m_streamReopenRequired = true;
-                    m_actualPayloadSize = m_frameDataSize;
-                    emit errorOccurred(m_camIndex,
-                        QString("Camera %1 payload grew to %2 bytes, exceeding the current %3-byte stream buffers; disconnect and reconnect after changing geometry/TDI.")
-                            .arg(m_camIndex).arg(actualPayloadSize).arg(m_frameDataSize));
-                }
-                else
-                {
-                    m_actualPayloadSize = actualPayloadSize;
-                }
-            }
-        }
-    }
 }
 
 size_t CameraWorker::queryActualPayloadSize() const
@@ -393,8 +348,15 @@ bool CameraWorker::applyCameraParameters(bool includeGeometry)
             if (status == 12314) emit featureUnsupported(m_camIndex, "TriggerMode");
         }
 
+        try {
+            KYFG_SetCameraValueEnum_ByValueName(m_camHandle, "AcquisitionMode", "Continuous");
+        } catch (...) {}
+        try {
+            KYFG_SetCameraValueBool(m_camHandle, "AcquisitionFrameRateEnable", true);
+        } catch (...) {}
+
         // 1. Configure AcquisitionFrameRate first
-        const double requestedFps = std::max(0.001, static_cast<double>(m_params.fps));
+        const double requestedFps = (m_params.fps > 0.05f) ? static_cast<double>(m_params.fps) : 10.0;
         double targetFps = requestedFps;
         double maxFpsBeforeSet = 0.0;
         try {
@@ -418,7 +380,7 @@ bool CameraWorker::applyCameraParameters(bool includeGeometry)
         try {
             actualFps = KYFG_GetCameraValueFloat(m_camHandle, "AcquisitionFrameRate");
         } catch (...) {}
-        if (actualFps <= 0.0) actualFps = targetFps;
+        if (actualFps <= 0.05) actualFps = targetFps;
         m_params.fps = static_cast<float>(actualFps);
         m_params.maxFps = static_cast<float>(maxFpsBeforeSet > 0.0 ? maxFpsBeforeSet : actualFps);
 
@@ -460,8 +422,8 @@ bool CameraWorker::applyCameraParameters(bool includeGeometry)
             actualExposure = KYFG_GetCameraValueFloat(m_camHandle, "ExposureTime");
         } catch (...) {}
         if (maxFps > 0.0) m_params.maxFps = static_cast<float>(maxFps);
-        m_params.fps = static_cast<float>(actualFps);
-        m_params.exposure = static_cast<float>(actualExposure);
+        if (actualFps > 0.05) m_params.fps = static_cast<float>(actualFps);
+        if (actualExposure > 0.0) m_params.exposure = static_cast<float>(actualExposure);
         const QString acceptedMsg = QString("[Cam%1] Camera accepted: FPS=%2 MaxFPS=%3 Exposure=%4 us")
             .arg(m_camIndex)
             .arg(actualFps, 0, 'f', 2)
@@ -810,16 +772,24 @@ CameraParams CameraWorker::queryCameraParameters()
         if (h <= 0) h = KYFG_GetCameraValueInt(m_camHandle, "RegionHeight");
         if (h > 0) p.height = static_cast<int>(h);
 
-        double fps = KYFG_GetCameraValueFloat(m_camHandle, "AcquisitionFrameRate");
-        if (fps > 0.0) p.fps = static_cast<float>(fps);
+        double fps = 0.0;
+        try {
+            fps = KYFG_GetCameraValueFloat(m_camHandle, "AcquisitionFrameRate");
+        } catch (...) {}
+        if (fps > 0.05) p.fps = static_cast<float>(fps);
+        else if (p.fps <= 0.05f) p.fps = 10.0f;
 
         try {
             double maxFps = KYFG_GetCameraValueFloat(m_camHandle, "AcquisitionFrameRateMax");
             if (maxFps > 0.0) p.maxFps = static_cast<float>(maxFps);
         } catch (...) {}
 
-        double exp = KYFG_GetCameraValueFloat(m_camHandle, "ExposureTime");
+        double exp = 0.0;
+        try {
+            exp = KYFG_GetCameraValueFloat(m_camHandle, "ExposureTime");
+        } catch (...) {}
         if (exp > 0.0) p.exposure = static_cast<float>(exp);
+        else if (p.exposure <= 0.0f) p.exposure = 5000.0f;
 
         double gain = KYFG_GetCameraValueFloat(m_camHandle, "Gain");
         if (gain >= 0.0) p.gain = static_cast<float>(gain);
@@ -911,7 +881,14 @@ void CameraWorker::openCamera()
             auto status = KYFG_CameraOpen2(m_camHandle, NULL);
             if (status != FGSTATUS_OK)
             {
-                emit errorOccurred(m_camIndex, QString("Camera #%1 was not connected successfully").arg(m_camIndex));
+                // If camera link was left locked/open by a previous crash, close it and retry
+                KYFG_CameraClose(m_camHandle);
+                QThread::msleep(100);
+                status = KYFG_CameraOpen2(m_camHandle, NULL);
+            }
+            if (status != FGSTATUS_OK)
+            {
+                emit errorOccurred(m_camIndex, QString("Camera #%1 was not connected successfully (status: 0x%2)").arg(m_camIndex).arg(status, 0, 16));
                 return;
             }
             m_cameraOpened = true;
@@ -920,6 +897,7 @@ void CameraWorker::openCamera()
 
         // Apply user-configured parameters to camera first
         applyCameraParameters(true);
+        m_paramsApplied = true;
 
         m_params = queryCameraParameters();
         emit paramsQueried(m_camIndex, m_params);
@@ -931,6 +909,7 @@ void CameraWorker::openCamera()
         auto status = KYFG_StreamCreate(m_camHandle, &m_streamHandle, 0);
         if (status != FGSTATUS_OK || m_streamHandle == INVALID_STREAMHANDLE)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 stream create failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -938,9 +917,8 @@ void CameraWorker::openCamera()
         status = KYFG_StreamBufferCallbackRegister(m_streamHandle, streamCallback, this);
         if (status != FGSTATUS_OK)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 callback register failed: %2").arg(m_camIndex).arg(status));
-            KYFG_StreamDelete(m_streamHandle);
-            m_streamHandle = INVALID_STREAMHANDLE;
             return;
         }
         {
@@ -954,6 +932,7 @@ void CameraWorker::openCamera()
         status = KYFG_StreamGetInfo(m_streamHandle, KY_STREAM_INFO_PAYLOAD_SIZE, &frameDataSize, NULL, NULL);
         if (status != FGSTATUS_OK || frameDataSize == 0)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 payload size query failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -961,6 +940,7 @@ void CameraWorker::openCamera()
         status = KYFG_StreamGetInfo(m_streamHandle, KY_STREAM_INFO_BUF_ALIGNMENT, &frameDataAligment, NULL, NULL);
         if (status != FGSTATUS_OK || frameDataAligment == 0)
         {
+            cleanupCameraLocked();
             emit errorOccurred(m_camIndex, QString("Camera %1 buffer alignment query failed: %2").arg(m_camIndex).arg(status));
             return;
         }
@@ -970,46 +950,23 @@ void CameraWorker::openCamera()
             m_pBuffers[i] = alignedAllocate(frameDataSize, frameDataAligment);
             if (!m_pBuffers[i])
             {
+                cleanupCameraLocked();
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer allocation failed at index %2").arg(m_camIndex).arg(i));
-                for (int j = 0; j < i; ++j) {
-                    if (m_pBuffers[j]) {
-                        alignedFree(m_pBuffers[j]);
-                        m_pBuffers[j] = nullptr;
-                    }
-                    m_streamBuffers[j] = 0;
-                }
-                if (m_streamHandle != INVALID_STREAMHANDLE) {
-                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
-                    KYFG_StreamDelete(m_streamHandle);
-                    m_streamHandle = INVALID_STREAMHANDLE;
-                }
                 return;
             }
 
             status = KYFG_BufferAnnounce(m_streamHandle, m_pBuffers[i], frameDataSize, NULL, &m_streamBuffers[i]);
             if (status != FGSTATUS_OK)
             {
+                cleanupCameraLocked();
                 emit errorOccurred(m_camIndex, QString("Camera %1 buffer announce failed at index %2: %3").arg(m_camIndex).arg(i).arg(status));
-                alignedFree(m_pBuffers[i]);
-                m_pBuffers[i] = nullptr;
-                for (int j = 0; j < i; ++j) {
-                    if (m_pBuffers[j]) {
-                        alignedFree(m_pBuffers[j]);
-                        m_pBuffers[j] = nullptr;
-                    }
-                    m_streamBuffers[j] = 0;
-                }
-                if (m_streamHandle != INVALID_STREAMHANDLE) {
-                    KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
-                    KYFG_StreamDelete(m_streamHandle);
-                    m_streamHandle = INVALID_STREAMHANDLE;
-                }
                 return;
             }
         }
         m_frameId = 0;
         m_frameDataSize = frameDataSize;
         m_streamReopenRequired = false;
+        m_paramsApplied = true;
         m_actualPayloadSize = queryActualPayloadSize();
         if (m_actualPayloadSize > m_frameDataSize)
             m_actualPayloadSize = m_frameDataSize;
@@ -1022,10 +979,44 @@ void CameraWorker::openCamera()
         QTimer::singleShot(0, this, &CameraWorker::pollTemperature);
     }
     catch (const std::exception& e) {
+        cleanupCameraLocked();
         emit errorOccurred(m_camIndex, QString("Exception in openCamera: %1").arg(e.what()));
     }
     catch (...) {
+        cleanupCameraLocked();
         emit errorOccurred(m_camIndex, "Unknown exception in openCamera");
+    }
+}
+
+// ── cleanupCameraLocked ────────────────────────────────────────────────
+void CameraWorker::cleanupCameraLocked()
+{
+    // Unregister callback and delete stream cleanly
+    if (m_streamHandle != INVALID_STREAMHANDLE) {
+        const STREAM_HANDLE streamToDelete = m_streamHandle;
+        m_streamHandle = INVALID_STREAMHANDLE;
+
+        KYFG_StreamBufferCallbackUnregister(streamToDelete, streamCallback);
+        KYFG_StreamDelete(streamToDelete);
+    }
+
+    // Free buffers only after stream is completely deleted
+    for (int i = 0; i < 16; ++i) {
+        if (m_pBuffers[i]) {
+            alignedFree(m_pBuffers[i]);
+            m_pBuffers[i] = nullptr;
+        }
+        m_streamBuffers[i] = 0;
+    }
+    m_frameDataSize = 0;
+    m_actualPayloadSize = 0;
+    m_streamReopenRequired = false;
+
+    if (m_cameraOpened.exchange(false) && m_camHandle != INVALID_CAMHANDLE) {
+        const auto status = KYFG_CameraClose(m_camHandle);
+        if (status != FGSTATUS_OK) {
+            emit logMessage(QString("[Cam%1] Camera close returned %2").arg(m_camIndex).arg(status));
+        }
     }
 }
 
@@ -1042,34 +1033,7 @@ void CameraWorker::closeCamera()
 
     try {
         QMutexLocker lk(&m_mutex);
-
-        // Unregister callback and delete stream
-        if (m_streamHandle != INVALID_STREAMHANDLE) {
-            const STREAM_HANDLE streamToDelete = m_streamHandle;
-            m_streamHandle = INVALID_STREAMHANDLE;
-            KYFG_StreamBufferCallbackUnregister(streamToDelete, streamCallback);
-            KYFG_StreamDelete(streamToDelete);
-        }
-
-        // Free buffers
-        for (int i = 0; i < 16; ++i) {
-            if (m_pBuffers[i]) {
-                alignedFree(m_pBuffers[i]);
-                m_pBuffers[i] = nullptr;
-            }
-            m_streamBuffers[i] = 0;
-        }
-        m_frameDataSize = 0;
-        m_actualPayloadSize = 0;
-        m_streamReopenRequired = false;
-
-        if (m_cameraOpened.exchange(false) && m_camHandle != INVALID_CAMHANDLE) {
-            const auto status = KYFG_CameraClose(m_camHandle);
-            if (status != FGSTATUS_OK) {
-                emit logMessage(QString("[Cam%1] Camera close returned %2").arg(m_camIndex).arg(status));
-            }
-        }
-
+        cleanupCameraLocked();
         emit cameraClosed(m_camIndex);
     }
     catch (const std::exception& e) {
@@ -1171,6 +1135,33 @@ void CameraWorker::setSaving(bool saving)
     m_saving = saving;
 }
 
+void CameraWorker::restartStreamAfterLiveUpdate(bool wasStreaming)
+{
+    if (!wasStreaming || m_streamHandle == INVALID_STREAMHANDLE)
+        return;
+
+    auto status = KYFG_BufferQueueAll(m_streamHandle, KY_ACQ_QUEUE_UNQUEUED, KY_ACQ_QUEUE_INPUT);
+    if (status != FGSTATUS_OK) {
+        m_streaming = false;
+        const QString msg = QString("[Cam%1] Could not requeue buffers after live parameter update: %2")
+            .arg(m_camIndex).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit errorOccurred(m_camIndex, msg);
+        return;
+    }
+
+    status = KYFG_CameraStart(m_camHandle, m_streamHandle, 0);
+    if (status != FGSTATUS_OK) {
+        m_streaming = false;
+        const QString msg = QString("[Cam%1] Could not resume stream after live parameter update: %2")
+            .arg(m_camIndex).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit errorOccurred(m_camIndex, msg);
+    }
+}
+
 
 void CameraWorker::setLiveExposure(double exposureUs)
 {
@@ -1178,6 +1169,10 @@ void CameraWorker::setLiveExposure(double exposureUs)
         QMutexLocker lk(&m_mutex);
         if (m_camHandle == INVALID_CAMHANDLE || !m_cameraOpened)
             return;
+
+        const bool wasStreaming = m_streaming.load();
+        if (wasStreaming)
+            KYFG_CameraStop(m_camHandle);
 
         double targetExp = std::max(1.0, exposureUs);
         double expMax = 0.0;
@@ -1196,6 +1191,7 @@ void CameraWorker::setLiveExposure(double exposureUs)
                 .arg(targetExp, 0, 'f', 3)
                 .arg(status));
             if (status == 12314) emit featureUnsupported(m_camIndex, "ExposureTime");
+            restartStreamAfterLiveUpdate(wasStreaming);
             return;
         }
 
@@ -1211,6 +1207,7 @@ void CameraWorker::setLiveExposure(double exposureUs)
         emit logMessage(msg);
 
         emit paramsQueried(m_camIndex, m_params);
+        restartStreamAfterLiveUpdate(wasStreaming);
     }
     catch (const std::exception& e) {
         emit logMessage(QString("[Cam%1] Exception in setLiveExposure: %2").arg(m_camIndex).arg(e.what()));
@@ -1227,6 +1224,10 @@ void CameraWorker::setLiveGain(double gainDb)
         if (m_camHandle == INVALID_CAMHANDLE || !m_cameraOpened)
             return;
 
+        const bool wasStreaming = m_streaming.load();
+        if (wasStreaming)
+            KYFG_CameraStop(m_camHandle);
+
         const auto status = KYFG_SetCameraValueFloat(m_camHandle, "Gain", gainDb);
         if (status != FGSTATUS_OK)
         {
@@ -1235,10 +1236,22 @@ void CameraWorker::setLiveGain(double gainDb)
                 .arg(gainDb, 0, 'f', 2)
                 .arg(status));
             if (status == 12314) emit featureUnsupported(m_camIndex, "Gain");
+            restartStreamAfterLiveUpdate(wasStreaming);
             return;
         }
 
-        m_params.gain = static_cast<float>(gainDb);
+        double actualGain = gainDb;
+        try {
+            actualGain = KYFG_GetCameraValueFloat(m_camHandle, "Gain");
+        } catch (...) {}
+        m_params.gain = static_cast<float>(actualGain);
+
+        const QString msg = QString("[Cam%1] Live Gain set to %2 dB (status %3)")
+            .arg(m_camIndex).arg(actualGain, 0, 'f', 2).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit paramsQueried(m_camIndex, m_params);
+        restartStreamAfterLiveUpdate(wasStreaming);
     }
     catch (const std::exception& e) {
         emit logMessage(QString("[Cam%1] Exception in setLiveGain: %2").arg(m_camIndex).arg(e.what()));
@@ -1334,8 +1347,8 @@ void CameraWorker::setLiveFps(double fps)
         double actualFps = targetFps;
         try {
             actualFps = KYFG_GetCameraValueFloat(m_camHandle, "AcquisitionFrameRate");
-            m_params.fps = static_cast<float>(actualFps);
-            m_params.maxFps = static_cast<float>(maxFpsBeforeSet > 0.0 ? maxFpsBeforeSet : actualFps);
+            if (actualFps > 0.05) m_params.fps = static_cast<float>(actualFps);
+            m_params.maxFps = static_cast<float>(maxFpsBeforeSet > 0.0 ? maxFpsBeforeSet : (actualFps > 0.05 ? actualFps : targetFps));
         } catch (...) {}
 
         // Adjust ExposureTime if needed so exposure fits within the new frame period with readout margin
@@ -1501,6 +1514,7 @@ void CameraWorker::applyGeometry(int width, int height)
             if (m_streamHandle != INVALID_STREAMHANDLE)
             {
                 KYFG_StreamBufferCallbackUnregister(m_streamHandle, streamCallback);
+                KYFG_BufferQueueAll(m_streamHandle, KY_ACQ_QUEUE_INPUT, KY_ACQ_QUEUE_UNQUEUED);
                 KYFG_StreamDelete(m_streamHandle);
                 m_streamHandle = INVALID_STREAMHANDLE;
             }

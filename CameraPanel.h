@@ -9,6 +9,8 @@
 #include <QPushButton>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QSlider>
+#include <QDoubleSpinBox>
 #include <QGroupBox>
 #include <QScrollArea>
 #include <QVBoxLayout>
@@ -49,10 +51,11 @@ public:
     QLineEdit*   savePathEdit;
     QPushButton* browseSaveBtn;
     QComboBox*   saveFormatCombo;
-    QComboBox*   saveModeCombo;
-    QCheckBox*   stopAfterDurationCheck;
-    QLineEdit*   saveDurationEdit;
-    QLineEdit*   widthEdit;
+    QComboBox*      saveModeCombo;
+    QSlider*        saveDurationSlider = nullptr;
+    QDoubleSpinBox* saveDurationSpin   = nullptr;
+    double          customLastDuration = 20.0;
+    QLineEdit*      widthEdit;
     QLineEdit*   heightEdit;
     QLineEdit*   fpsEdit;
     QLineEdit*   exposureEdit;
