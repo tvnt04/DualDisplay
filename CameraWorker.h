@@ -162,6 +162,7 @@ private:
     void endStreamCallback();
     void stopAcceptingStreamCallbacks();
     bool applyCameraParameters(bool includeGeometry);
+    void restartStreamAfterLiveUpdate(bool wasStreaming);
     CameraParams queryCameraParameters();
     size_t queryActualPayloadSize() const;
     void cleanupCameraLocked();

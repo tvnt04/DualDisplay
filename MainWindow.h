@@ -133,6 +133,8 @@ private:
     int durationToSliderIndex(double dur, int camIdx);
     QString getPreferencesFilePath() const;
     void appendLogLine(const QString& line);
+    void scheduleTimedShutdown(double durationSeconds);
+    void stopEverythingAndDisconnect();
     void updateCollapseButtonPosition();
     void updateLogButtonPosition();
     enum class PresetLayout {
@@ -145,6 +147,7 @@ private:
     CaptureController*  m_captureController = nullptr;
     PlaybackController* m_playbackController = nullptr;
     CalibrationEngine*  m_calibrationEngine = nullptr;
+    QTimer              m_autoDisconnectTimer;
     CameraPanel*        m_panels[2] = {};
     CameraUiState       m_cameraUiStates[2];
     QWidget*      m_panelParking = nullptr;

@@ -219,6 +219,9 @@ protected:
 // ═══════════════════════════════════════════════════════════════════════
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
+    m_autoDisconnectTimer.setSingleShot(true);
+    connect(&m_autoDisconnectTimer, &QTimer::timeout, this, &MainWindow::stopEverythingAndDisconnect);
+
     qRegisterMetaType<FramePacketPtr>("FramePacketPtr");
     qRegisterMetaType<CameraParams>("CameraParams");
 
@@ -3008,14 +3011,16 @@ void MainWindow::updateCameraAdvancedState(int idx, const QString& tdiMode, cons
     const bool revXChanged = (state.reverseX != reverseX);
     const bool revYChanged = (state.reverseY != reverseY);
     QString effectiveYShift = tdiYShift;
-    if (state.tdiMode != "TDI" && tdiMode == "TDI")
+    const bool stagesChanged = (state.tdiStages != tdiStages);
+    const bool enteringTdi = (state.tdiMode != "TDI" && tdiMode == "TDI");
+    if (tdiMode == "TDI" && (stagesChanged || enteringTdi))
     {
-        const int height = state.height.toInt();
-        const int stages = tdiStages.toInt();
-        bool shiftOk = false;
-        const int shift = tdiYShift.toInt(&shiftOk);
-        if (shiftOk && stages > 0 && shift == height / stages)
-            effectiveYShift = "16"; // Migrate the old automatic height/stage value.
+        bool heightOk = false;
+        bool stagesOk = false;
+        const int height = state.height.toInt(&heightOk);
+        const int stages = tdiStages.toInt(&stagesOk);
+        if (heightOk && height > 0 && stagesOk && stages > 0)
+            effectiveYShift = QString::number(std::max(1, height / stages));
     }
     const bool tdiChanged = (state.tdiMode != tdiMode || state.tdiStages != tdiStages || 
                              state.tdiYShift != effectiveYShift || state.tdiFrameCount != tdiFrameCount);
@@ -3205,6 +3210,9 @@ void MainWindow::onStartClicked(int idx)
         return;
     }
 
+    if (m_cameraUiStates[idx].stopAfterEnabled) {
+        scheduleTimedShutdown(m_cameraUiStates[idx].saveDuration.toDouble());
+    }
     m_cameraManager->startStream(idx);
 }
 
@@ -3250,9 +3258,45 @@ void MainWindow::onSaveClicked(int idx)
         QString initialLogText = m_logTerminal ? m_logTerminal->toPlainText() : QString();
         if (!m_captureController->startSave(idx, params, initialLogText)) {
             QMessageBox::critical(this, "Save Error", "Failed to start capture recording.");
+        } else if (params.stopAfterEnabled) {
+            scheduleTimedShutdown(params.saveDuration);
         }
     } else {
         m_captureController->stopSave(idx, false);
+        if (!m_saving[0] && !m_saving[1] && !m_captureController->isMergeSaving()) {
+            m_autoDisconnectTimer.stop();
+        }
+    }
+}
+
+void MainWindow::scheduleTimedShutdown(double durationSeconds)
+{
+    if (durationSeconds <= 0.0) return;
+
+    const int durationMs = static_cast<int>(std::ceil(durationSeconds * 1000.0));
+    if (!m_autoDisconnectTimer.isActive() ||
+        (m_autoDisconnectTimer.remainingTime() >= 0 && durationMs < m_autoDisconnectTimer.remainingTime())) {
+        m_autoDisconnectTimer.start(durationMs);
+    }
+}
+
+void MainWindow::stopEverythingAndDisconnect()
+{
+    if (m_captureController) {
+        m_captureController->stopSave(0, true);
+        m_captureController->stopSave(1, true);
+        m_captureController->stopMergeSave();
+    }
+
+    if (!m_cameraManager) return;
+
+    for (int i = 0; i < 2; ++i) {
+        if (m_connected[i]) {
+            m_cameraManager->disconnectCamera(i);
+        }
+    }
+    if (statusBar()) {
+        statusBar()->showMessage("Timed capture complete: stopped streams and disconnected cameras.", 5000);
     }
 }
 
@@ -3374,6 +3418,10 @@ void MainWindow::onStartAllClicked()
     bool anyStreaming = m_streaming[0] || m_streaming[1];
     if (anyStreaming) {
         if (m_cameraManager) m_cameraManager->stopAllStreams();
+        if (!m_saving[0] && !m_saving[1] &&
+            (!m_captureController || !m_captureController->isMergeSaving())) {
+            m_autoDisconnectTimer.stop();
+        }
         return;
     }
 
@@ -3384,6 +3432,16 @@ void MainWindow::onStartAllClicked()
 
     if (m_cameraManager) {
         m_cameraManager->startAllStreams();
+        double durationSeconds = 0.0;
+        for (int i = 0; i < 2; ++i) {
+            if (m_connected[i] && m_cameraUiStates[i].stopAfterEnabled) {
+                const double cameraDuration = m_cameraUiStates[i].saveDuration.toDouble();
+                if (cameraDuration > 0.0 && (durationSeconds <= 0.0 || cameraDuration < durationSeconds)) {
+                    durationSeconds = cameraDuration;
+                }
+            }
+        }
+        scheduleTimedShutdown(durationSeconds);
     }
 }
 
@@ -3401,6 +3459,7 @@ void MainWindow::onSaveAllClicked()
                 stopSave(i, false);
             }
         }
+        m_autoDisconnectTimer.stop();
     } else {
         for (int i = 0; i < 2; ++i) {
             if (m_streaming[i] && !m_saving[i]) {
@@ -3443,9 +3502,23 @@ void MainWindow::onMergeSaveClicked()
 
         if (!m_captureController->startMergeSave(sessionDir, opts)) {
             QMessageBox::critical(this, "Merge Save Error", QString("Failed to start merge save session in %1").arg(sessionDir));
+        } else {
+            double durationSeconds = 0.0;
+            for (int i = 0; i < 2; ++i) {
+                if (m_cameraUiStates[i].stopAfterEnabled) {
+                    const double cameraDuration = m_cameraUiStates[i].saveDuration.toDouble();
+                    if (cameraDuration > 0.0 && (durationSeconds <= 0.0 || cameraDuration < durationSeconds)) {
+                        durationSeconds = cameraDuration;
+                    }
+                }
+            }
+            scheduleTimedShutdown(durationSeconds);
         }
     } else {
         m_captureController->stopMergeSave();
+        if (!m_saving[0] && !m_saving[1]) {
+            m_autoDisconnectTimer.stop();
+        }
     }
 }
 

@@ -1135,6 +1135,33 @@ void CameraWorker::setSaving(bool saving)
     m_saving = saving;
 }
 
+void CameraWorker::restartStreamAfterLiveUpdate(bool wasStreaming)
+{
+    if (!wasStreaming || m_streamHandle == INVALID_STREAMHANDLE)
+        return;
+
+    auto status = KYFG_BufferQueueAll(m_streamHandle, KY_ACQ_QUEUE_UNQUEUED, KY_ACQ_QUEUE_INPUT);
+    if (status != FGSTATUS_OK) {
+        m_streaming = false;
+        const QString msg = QString("[Cam%1] Could not requeue buffers after live parameter update: %2")
+            .arg(m_camIndex).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit errorOccurred(m_camIndex, msg);
+        return;
+    }
+
+    status = KYFG_CameraStart(m_camHandle, m_streamHandle, 0);
+    if (status != FGSTATUS_OK) {
+        m_streaming = false;
+        const QString msg = QString("[Cam%1] Could not resume stream after live parameter update: %2")
+            .arg(m_camIndex).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit errorOccurred(m_camIndex, msg);
+    }
+}
+
 
 void CameraWorker::setLiveExposure(double exposureUs)
 {
@@ -1142,6 +1169,10 @@ void CameraWorker::setLiveExposure(double exposureUs)
         QMutexLocker lk(&m_mutex);
         if (m_camHandle == INVALID_CAMHANDLE || !m_cameraOpened)
             return;
+
+        const bool wasStreaming = m_streaming.load();
+        if (wasStreaming)
+            KYFG_CameraStop(m_camHandle);
 
         double targetExp = std::max(1.0, exposureUs);
         double expMax = 0.0;
@@ -1160,6 +1191,7 @@ void CameraWorker::setLiveExposure(double exposureUs)
                 .arg(targetExp, 0, 'f', 3)
                 .arg(status));
             if (status == 12314) emit featureUnsupported(m_camIndex, "ExposureTime");
+            restartStreamAfterLiveUpdate(wasStreaming);
             return;
         }
 
@@ -1175,6 +1207,7 @@ void CameraWorker::setLiveExposure(double exposureUs)
         emit logMessage(msg);
 
         emit paramsQueried(m_camIndex, m_params);
+        restartStreamAfterLiveUpdate(wasStreaming);
     }
     catch (const std::exception& e) {
         emit logMessage(QString("[Cam%1] Exception in setLiveExposure: %2").arg(m_camIndex).arg(e.what()));
@@ -1191,6 +1224,10 @@ void CameraWorker::setLiveGain(double gainDb)
         if (m_camHandle == INVALID_CAMHANDLE || !m_cameraOpened)
             return;
 
+        const bool wasStreaming = m_streaming.load();
+        if (wasStreaming)
+            KYFG_CameraStop(m_camHandle);
+
         const auto status = KYFG_SetCameraValueFloat(m_camHandle, "Gain", gainDb);
         if (status != FGSTATUS_OK)
         {
@@ -1199,10 +1236,22 @@ void CameraWorker::setLiveGain(double gainDb)
                 .arg(gainDb, 0, 'f', 2)
                 .arg(status));
             if (status == 12314) emit featureUnsupported(m_camIndex, "Gain");
+            restartStreamAfterLiveUpdate(wasStreaming);
             return;
         }
 
-        m_params.gain = static_cast<float>(gainDb);
+        double actualGain = gainDb;
+        try {
+            actualGain = KYFG_GetCameraValueFloat(m_camHandle, "Gain");
+        } catch (...) {}
+        m_params.gain = static_cast<float>(actualGain);
+
+        const QString msg = QString("[Cam%1] Live Gain set to %2 dB (status %3)")
+            .arg(m_camIndex).arg(actualGain, 0, 'f', 2).arg(status);
+        printTerminalLog(msg);
+        emit logMessage(msg);
+        emit paramsQueried(m_camIndex, m_params);
+        restartStreamAfterLiveUpdate(wasStreaming);
     }
     catch (const std::exception& e) {
         emit logMessage(QString("[Cam%1] Exception in setLiveGain: %2").arg(m_camIndex).arg(e.what()));
